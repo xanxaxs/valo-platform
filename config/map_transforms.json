@@ -1,0 +1,134 @@
+{
+  "Ascent": {
+    "xMultiplier": 7e-05,
+    "yMultiplier": -7e-05,
+    "xScalarToAdd": 0.813895,
+    "yScalarToAdd": 0.573242
+  },
+  "Split": {
+    "xMultiplier": 7.8e-05,
+    "yMultiplier": -7.8e-05,
+    "xScalarToAdd": 0.842188,
+    "yScalarToAdd": 0.697578
+  },
+  "Fracture": {
+    "xMultiplier": 7.8e-05,
+    "yMultiplier": -7.8e-05,
+    "xScalarToAdd": 0.556952,
+    "yScalarToAdd": 1.155886
+  },
+  "Bind": {
+    "xMultiplier": 5.9e-05,
+    "yMultiplier": -5.9e-05,
+    "xScalarToAdd": 0.576941,
+    "yScalarToAdd": 0.967566
+  },
+  "Skirmish A": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Skirmish B": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Skirmish C": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Breeze": {
+    "xMultiplier": 7e-05,
+    "yMultiplier": -7e-05,
+    "xScalarToAdd": 0.465123,
+    "yScalarToAdd": 0.833078
+  },
+  "District": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Kasbah": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Drift": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Glitch": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Piazza": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Abyss": {
+    "xMultiplier": 8.1e-05,
+    "yMultiplier": -8.1e-05,
+    "xScalarToAdd": 0.5,
+    "yScalarToAdd": 0.5
+  },
+  "Lotus": {
+    "xMultiplier": 7.2e-05,
+    "yMultiplier": -7.2e-05,
+    "xScalarToAdd": 0.454789,
+    "yScalarToAdd": 0.917752
+  },
+  "Sunset": {
+    "xMultiplier": 7.8e-05,
+    "yMultiplier": -7.8e-05,
+    "xScalarToAdd": 0.5,
+    "yScalarToAdd": 0.515625
+  },
+  "Basic Training": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Pearl": {
+    "xMultiplier": 7.8e-05,
+    "yMultiplier": -7.8e-05,
+    "xScalarToAdd": 0.480469,
+    "yScalarToAdd": 0.916016
+  },
+  "Icebox": {
+    "xMultiplier": 7.2e-05,
+    "yMultiplier": -7.2e-05,
+    "xScalarToAdd": 0.460214,
+    "yScalarToAdd": 0.304687
+  },
+  "The Range": {
+    "xMultiplier": 0,
+    "yMultiplier": 0,
+    "xScalarToAdd": 0,
+    "yScalarToAdd": 0
+  },
+  "Corrode": {
+    "xMultiplier": 7e-05,
+    "yMultiplier": -7e-05,
+    "xScalarToAdd": 0.526158,
+    "yScalarToAdd": 0.5
+  },
+  "Haven": {
+    "xMultiplier": 7.5e-05,
+    "yMultiplier": -7.5e-05,
+    "xScalarToAdd": 1.09345,
+    "yScalarToAdd": 0.642728
+  }
+}

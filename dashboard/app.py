@@ -10,12 +10,15 @@ import json
 import base64
 from typing import Any
 import math
+import urllib.request
+import urllib.parse
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
 import pandas as pd
+import streamlit.components.v1 as components
 
 from src.db.database import get_session, init_db
 from src.db.models import AudioSegment, Match, PlayerMatchStats, Round, MatchEventSnapshot
@@ -30,6 +33,7 @@ MAPS_DIR = ASSETS_DIR / "maps"
 
 # Replay calibration persistence
 REPLAY_CALIBRATION_PATH = Path(__file__).parent.parent / "config" / "replay_calibration.json"
+MAP_TRANSFORMS_PATH = Path(__file__).parent.parent / "config" / "map_transforms.json"
 
 
 def _load_replay_calibration() -> dict[str, Any]:
@@ -55,6 +59,58 @@ def _save_replay_calibration(map_name: str, calibration: dict[str, Any]) -> None
     except Exception:
         # best-effort; UI will still work without persistence
         pass
+
+
+def _load_map_transforms() -> dict[str, Any]:
+    """Load map transform params (xMultiplier, yMultiplier, xScalarToAdd, yScalarToAdd) keyed by mapName."""
+    try:
+        if MAP_TRANSFORMS_PATH.exists():
+            with open(MAP_TRANSFORMS_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_map_transforms(data: dict[str, Any]) -> None:
+    try:
+        MAP_TRANSFORMS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(MAP_TRANSFORMS_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def _fetch_map_transforms_from_valorant_api() -> dict[str, Any]:
+    """
+    Fetch map transforms from public content API.
+    Uses fields: xMultiplier, yMultiplier, xScalarToAdd, yScalarToAdd.
+    """
+    url = "https://valorant-api.com/v1/maps"
+    with urllib.request.urlopen(url, timeout=10) as resp:
+        raw = resp.read().decode("utf-8", errors="ignore")
+    payload = json.loads(raw)
+    out: dict[str, Any] = {}
+    for m in payload.get("data", []) or []:
+        name = m.get("displayName")
+        if not name:
+            continue
+        # Some maps may omit these; keep only complete records
+        xm = m.get("xMultiplier")
+        ym = m.get("yMultiplier")
+        xs = m.get("xScalarToAdd")
+        ys = m.get("yScalarToAdd")
+        if xm is None or ym is None or xs is None or ys is None:
+            continue
+        out[name] = {
+            "xMultiplier": xm,
+            "yMultiplier": ym,
+            "xScalarToAdd": xs,
+            "yScalarToAdd": ys,
+        }
+    return out
 
 # Agent name mapping for folder names
 AGENT_FOLDER_MAP = {
@@ -542,7 +598,7 @@ def render_stats_table(players):
         
         # FK diff display
         fk_display = f"+{fk_diff}" if fk_diff > 0 else str(fk_diff)
-
+                    
         data.append({
             "icon_b64": icon_b64,
             "player_name": p.player_name or "Unknown",
@@ -660,42 +716,46 @@ def _render_rib_style_map(
     - calibration: flip_y / offset_x / offset_y / scale
     """
     import base64
-    import plotly.graph_objects as go
 
-    # --- Map image (full SVG) ---
+    # --- Map image ---
+    # Plotlyのlayout_imageはSVG(base64)が環境によって描画されないことがあるため、
+    # SVGはutf8+URLエンコードでdata URIを作る。無い場合はthumb(webp)へフォールバック。
+    map_source = ""
     map_svg_path = get_map_svg_path(map_name)
     if map_svg_path.exists():
-        with open(map_svg_path, "rb") as f:
-            map_b64 = base64.b64encode(f.read()).decode("utf-8")
-        map_mime = "image/svg+xml"
-    else:
-        # Fallback to thumbnail if SVG not found
+        try:
+            svg_text = map_svg_path.read_text(encoding="utf-8")
+            map_source = "data:image/svg+xml;utf8," + urllib.parse.quote(svg_text)
+        except Exception:
+            map_source = ""
+    if not map_source:
         thumb_path = get_map_thumbnail_path(map_name)
-        map_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
-        map_mime = "image/webp"
+        thumb_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
+        if thumb_b64:
+            map_source = f"data:image/webp;base64,{thumb_b64}"
 
-    # --- Bounds (image placement + axis range) per map ---
-    MAP_DEFAULT_BOUNDS = {
-        "Abyss": {"x_min": -5000, "x_max": 5000, "y_min": -4000, "y_max": 2000},
-        "Ascent": {"x_min": -6000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
-        "Bind": {"x_min": -5000, "x_max": 7500, "y_min": -5000, "y_max": 7000},
-        "Haven": {"x_min": -6500, "x_max": 7500, "y_min": -5000, "y_max": 9000},
-        "Split": {"x_min": -6000, "x_max": 7000, "y_min": -5500, "y_max": 7500},
-        "Icebox": {"x_min": -5000, "x_max": 7000, "y_min": -5000, "y_max": 7000},
-        "Breeze": {"x_min": -7000, "x_max": 9000, "y_min": -6000, "y_max": 9000},
-        "Fracture": {"x_min": -7000, "x_max": 7000, "y_min": -7000, "y_max": 7000},
-        "Pearl": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
-        "Lotus": {"x_min": -7000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
-        "Sunset": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
-        "Corrode": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
-    }
-    fallback_bounds = {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000}
-    default_bounds = MAP_DEFAULT_BOUNDS.get(map_name, fallback_bounds)
+    # --- Coordinate transform (rib.gg/heatmap style) ---
+    # Prefer official map transform (xMultiplier/yMultiplier/xScalarToAdd/yScalarToAdd)
+    # Fallback to bounds-based normalization if transform is unavailable.
+    transforms = _load_map_transforms()
+    if not transforms:
+        # try fetch once, then persist for next run
+        try:
+            fetched = _fetch_map_transforms_from_valorant_api()
+            if fetched:
+                transforms = fetched
+                _save_map_transforms(fetched)
+        except Exception:
+            transforms = {}
+
+    t = transforms.get(map_name)
+
+    fallback_bounds = {"x_min": -6000.0, "x_max": 8000.0, "y_min": -5000.0, "y_max": 8000.0}
     b = {
-        "x_min": float(calibration.get("x_min", default_bounds["x_min"])),
-        "x_max": float(calibration.get("x_max", default_bounds["x_max"])),
-        "y_min": float(calibration.get("y_min", default_bounds["y_min"])),
-        "y_max": float(calibration.get("y_max", default_bounds["y_max"])),
+        "x_min": float(calibration.get("x_min", fallback_bounds["x_min"])),
+        "x_max": float(calibration.get("x_max", fallback_bounds["x_max"])),
+        "y_min": float(calibration.get("y_min", fallback_bounds["y_min"])),
+        "y_max": float(calibration.get("y_max", fallback_bounds["y_max"])),
     }
 
     # --- Calibration ---
@@ -705,13 +765,35 @@ def _render_rib_style_map(
     offset_y = float(calibration.get("offset_y", 0.0))
     scale = float(calibration.get("scale", 1.0))
 
+    def _bounds_to_norm(x: float, y: float) -> tuple[float, float]:
+        nx = (x - b["x_min"]) / max((b["x_max"] - b["x_min"]), 1e-9)
+        ny = (y - b["y_min"]) / max((b["y_max"] - b["y_min"]), 1e-9)
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        return nx, ny
+
+    def _game_to_norm(x: float, y: float) -> tuple[float, float]:
+        # Tracker heatmap formula: x = victimLocationY * xMultiplier + xScalarToAdd
+        #                        y = victimLocationX * yMultiplier + yScalarToAdd
+        if t:
+            nx = (y * float(t["xMultiplier"])) + float(t["xScalarToAdd"])
+            ny = (x * float(t["yMultiplier"])) + float(t["yScalarToAdd"])
+            nx = max(0.0, min(1.0, nx))
+            ny = max(0.0, min(1.0, ny))
+            return nx, ny
+        return _bounds_to_norm(x, y)
+
     def cal_xy(x: float, y: float) -> tuple[float, float]:
-        xx = (x * scale) + offset_x
-        yy = (y * scale) + offset_y
+        # Normalize to 0-1 first, then apply small calibration in normalized space.
+        nx, ny = _game_to_norm(x, y)
+        xx = (nx * scale) + (offset_x / 10000.0)
+        yy = (ny * scale) + (offset_y / 10000.0)
         if flip_x:
-            xx = -xx
+            xx = 1.0 - xx
         if flip_y:
-            yy = -yy
+            yy = 1.0 - yy
+        xx = max(0.0, min(1.0, xx))
+        yy = max(0.0, min(1.0, yy))
         return xx, yy
 
     killer_puuid = event_data.get("killer") or ""
@@ -754,66 +836,29 @@ def _render_rib_style_map(
             }
         )
 
-    fig = go.Figure()
+    # --- Build normalized points list (0..1) ---
 
-    # Background map image: stretch to bounds
-    if map_b64:
-        fig.add_layout_image(
-            dict(
-                source=f"data:{map_mime};base64,{map_b64}",
-                x=b["x_min"],
-                y=b["y_max"],
-                xref="x",
-                yref="y",
-                sizex=b["x_max"] - b["x_min"],
-                sizey=b["y_max"] - b["y_min"],
-                sizing="stretch",
-                opacity=1.0,
-                layer="below",
-            )
-        )
+    # --- Render with HTML (SVG background + absolute overlay), like tracker heatmap ---
+    # This avoids Plotly not rendering SVG layout_image in some environments.
 
-    # Points
-    def add_player(pt: dict):
-        base_color = "#0ea5e9" if pt["team"] == "blue" else "#ff4655"
-        color = base_color if pt["is_alive"] else "#94a3b8"
-        symbol = "star" if pt["is_killer"] else ("x" if pt["is_victim"] else "circle")
-        size = 18 if (pt["is_killer"] or pt["is_victim"]) else 14
-        line_color = "#fbbf24" if pt["is_killer"] else ("#ff4655" if pt["is_victim"] else base_color)
-        line_w = 3 if (pt["is_killer"] or pt["is_victim"]) else 2
+    svg_b64 = ""
+    if map_svg_path.exists():
+        try:
+            svg_b64 = base64.b64encode(map_svg_path.read_bytes()).decode("utf-8")
+        except Exception:
+            svg_b64 = ""
 
-        mode = "markers+text" if show_names else "markers"
-        kwargs: dict[str, Any] = {}
-        if show_names:
-            kwargs.update(
-                dict(
-                    text=[pt["name"][:10]],
-                    textposition="top center",
-                    textfont=dict(size=10, color=base_color, family="Arial Black"),
-                )
-            )
+    # Decide which image to show (prefer SVG from assets; fallback to thumb/webp)
+    if svg_b64:
+        img_tag = f'<img id="vt-map" src="data:image/svg+xml;base64,{svg_b64}" style="display:block; width:100%; max-width:900px; height:auto;" />'
+    elif map_source:
+        img_tag = f'<img id="vt-map" src="{map_source}" style="display:block; width:100%; max-width:900px; height:auto;" />'
+    else:
+        img_tag = '<div style="width:900px;height:520px;background:#f1f5f9;border-radius:12px;"></div>'
 
-        fig.add_trace(
-            go.Scatter(
-                x=[pt["x"]],
-                y=[pt["y"]],
-                mode=mode,
-                marker=dict(size=size, color=color, symbol=symbol, line=dict(color=line_color, width=line_w)),
-                hovertemplate=(
-                    f"<b>{pt['name']}</b><br>"
-                    f"team: {pt['team']}<br>"
-                    f"x={pt['x']:.0f}, y={pt['y']:.0f}<extra></extra>"
-                ),
-                showlegend=False,
-                **kwargs,
-            )
-        )
-
-    # Trace layer (rib.ggっぽい “軌跡/分布”)
+    # Convert trace_points to normalized list
+    trace_norm = []
     if trace_points:
-        tx = []
-        ty = []
-        tc = []
         for p in trace_points:
             try:
                 x = float(p.get("x"))
@@ -822,68 +867,138 @@ def _render_rib_style_map(
                 continue
             team = p.get("team_id") or "blue"
             xx, yy = cal_xy(x, y)
-            tx.append(xx)
-            ty.append(yy)
-            tc.append("#0ea5e9" if team == "blue" else "#ff4655")
+            trace_norm.append({"x": xx, "y": yy, "team": team})
 
-        if tx:
-            fig.add_trace(
-                go.Scatter(
-                    x=tx,
-                    y=ty,
-                    mode="markers",
-                    marker=dict(size=3, color=tc, opacity=0.10),
-                    hoverinfo="skip",
-                    showlegend=False,
-                )
-            )
-
-    for pt in norm:
-        add_player(pt)
-
-    # Kill line
     killer_pt = next((p for p in norm if p["is_killer"]), None)
     victim_pt = next((p for p in norm if p["is_victim"]), None)
-    if killer_pt and victim_pt:
-        fig.add_trace(
-            go.Scatter(
-                x=[killer_pt["x"], victim_pt["x"]],
-                y=[killer_pt["y"], victim_pt["y"]],
-                mode="lines",
-                line=dict(color="#fbbf24", width=2, dash="dot"),
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
 
-    fig.update_layout(
-        height=520,
-        margin=dict(l=0, r=0, t=0, b=0),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-    )
-    fig.update_xaxes(
-        range=[b["x_min"], b["x_max"]],
-        showgrid=False,
-        zeroline=False,
-        showticklabels=False,
-        fixedrange=lock_view,
-    )
-    fig.update_yaxes(
-        range=[b["y_min"], b["y_max"]],
-        showgrid=False,
-        zeroline=False,
-        showticklabels=False,
-        scaleanchor="x",
-        scaleratio=1,
-        fixedrange=lock_view,
-    )
+    payload = {
+        "svg_b64": svg_b64,
+        "fallback_img": map_source,  # may be webp data uri
+        "players": [
+            {
+                "name": p["name"],
+                "team": p["team"],
+                "x": p["x"],
+                "y": p["y"],
+                "alive": p["is_alive"],
+                "killer": p["is_killer"],
+                "victim": p["is_victim"],
+            }
+            for p in norm
+        ],
+        "traces": trace_norm[:2500],
+        "kill_line": {
+            "x1": killer_pt["x"],
+            "y1": killer_pt["y"],
+            "x2": victim_pt["x"],
+            "y2": victim_pt["y"],
+        }
+        if killer_pt and victim_pt
+        else None,
+        "show_names": bool(show_names),
+        "lock_view": bool(lock_view),
+    }
 
-    st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config={"displayModeBar": False, "scrollZoom": not lock_view},
-    )
+    html = f"""
+    <div id="vt-wrap" style="width:100%; display:flex; justify-content:center;">
+      <div id="vt-stage" style="position:relative; display:inline-block; max-width:100%; user-select:none;">
+        {img_tag}
+        <canvas id="vt-canvas" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none;"></canvas>
+        <div id="vt-overlay" style="position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none;"></div>
+      </div>
+    </div>
+    <script>
+      const DATA = {json.dumps(payload)};
+
+      const stage = document.getElementById('vt-stage');
+      const img = document.getElementById('vt-map');
+      const canvas = document.getElementById('vt-canvas');
+      const overlay = document.getElementById('vt-overlay');
+
+      function resizeCanvas() {{
+        if (!img) return;
+        const rect = img.getBoundingClientRect();
+        canvas.width = Math.round(rect.width);
+        canvas.height = Math.round(rect.height);
+        overlay.style.width = rect.width + 'px';
+        overlay.style.height = rect.height + 'px';
+      }}
+
+      function draw() {{
+        if (!img) return;
+        resizeCanvas();
+        const ctx = canvas.getContext('2d');
+        if (!ctx) return;
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+
+        // traces (very light)
+        for (const p of (DATA.traces || [])) {{
+          const x = p.x * canvas.width;
+          const y = p.y * canvas.height;
+          ctx.fillStyle = (p.team === 'blue') ? 'rgba(14,165,233,0.08)' : 'rgba(255,70,85,0.08)';
+          ctx.beginPath();
+          ctx.arc(x, y, 2, 0, Math.PI*2);
+          ctx.fill();
+        }}
+
+        // kill line
+        if (DATA.kill_line) {{
+          ctx.strokeStyle = 'rgba(251,191,36,0.9)';
+          ctx.setLineDash([6,4]);
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(DATA.kill_line.x1 * canvas.width, DATA.kill_line.y1 * canvas.height);
+          ctx.lineTo(DATA.kill_line.x2 * canvas.width, DATA.kill_line.y2 * canvas.height);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }}
+
+        // players
+        overlay.innerHTML = '';
+        for (const p of (DATA.players || [])) {{
+          const el = document.createElement('div');
+          const base = (p.team === 'blue') ? '#0ea5e9' : '#ff4655';
+          const color = p.alive ? base : '#94a3b8';
+          const r = (p.killer || p.victim) ? 8 : 6;
+          el.style.position = 'absolute';
+          el.style.left = (p.x * 100) + '%';
+          el.style.top  = (p.y * 100) + '%';
+          el.style.width = (r*2) + 'px';
+          el.style.height = (r*2) + 'px';
+          el.style.transform = 'translate(-50%,-50%)';
+          el.style.borderRadius = '999px';
+          el.style.background = color;
+          el.style.border = '2px solid ' + (p.killer ? '#fbbf24' : (p.victim ? '#ff4655' : base));
+          el.style.boxShadow = p.killer ? '0 0 12px rgba(251,191,36,0.6)' : 'none';
+          overlay.appendChild(el);
+
+          if (DATA.show_names) {{
+            const label = document.createElement('div');
+            label.textContent = (p.name || '').slice(0,10);
+            label.style.position='absolute';
+            label.style.left = (p.x * 100) + '%';
+            label.style.top  = (p.y * 100) + '%';
+            label.style.transform='translate(-50%,-160%)';
+            label.style.fontSize='11px';
+            label.style.fontWeight='700';
+            label.style.color=base;
+            label.style.textShadow='0 1px 2px rgba(0,0,0,0.15)';
+            overlay.appendChild(label);
+          }}
+        }}
+      }}
+
+      if (img && img.complete) {{
+        draw();
+      }} else if (img) {{
+        img.onload = draw;
+      }}
+      window.addEventListener('resize', () => draw());
+    </script>
+    """
+
+    components.html(html, height=560, scrolling=False)
 
 
 def show_statistics():
@@ -1201,7 +1316,9 @@ def show_replay():
     b_ymin = float(saved.get("y_min", default_b["y_min"]))
     b_ymax = float(saved.get("y_max", default_b["y_max"]))
     flip_x = bool(saved.get("flip_x", False))
-    flip_y = bool(saved.get("flip_y", True))
+    # When using official map transforms (xMultiplier/...), Y is already in "top-origin" space.
+    # So default flip_y should be False unless user saved otherwise.
+    flip_y = bool(saved.get("flip_y", False))
     offset_x = float(saved.get("offset_x", 0.0))
     offset_y = float(saved.get("offset_y", 0.0))
     scale = float(saved.get("scale", 1.0))
