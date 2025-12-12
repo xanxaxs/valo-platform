@@ -20,8 +20,18 @@ import streamlit as st
 import pandas as pd
 import streamlit.components.v1 as components
 
+from sqlalchemy import or_
 from src.db.database import get_session, init_db
 from src.db.models import AudioSegment, Match, PlayerMatchStats, Round, MatchEventSnapshot
+
+
+def _custom_match_filter():
+    """Filter for custom matches only (queue_id is empty or 'custom')."""
+    return or_(
+        Match.queue_id == "",
+        Match.queue_id == "custom",
+        Match.queue_id.is_(None),
+    )
 
 # Initialize database
 init_db()
@@ -85,8 +95,9 @@ def _save_map_transforms(data: dict[str, Any]) -> None:
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def _fetch_map_transforms_from_valorant_api() -> dict[str, Any]:
     """
-    Fetch map transforms from public content API.
-    Uses fields: xMultiplier, yMultiplier, xScalarToAdd, yScalarToAdd.
+    Fetch map transforms and displayIcon URLs from public content API.
+    Uses fields: xMultiplier, yMultiplier, xScalarToAdd, yScalarToAdd, displayIcon.
+    Also stores UUID for reverse lookup.
     """
     url = "https://valorant-api.com/v1/maps"
     with urllib.request.urlopen(url, timeout=10) as resp:
@@ -102,6 +113,8 @@ def _fetch_map_transforms_from_valorant_api() -> dict[str, Any]:
         ym = m.get("yMultiplier")
         xs = m.get("xScalarToAdd")
         ys = m.get("yScalarToAdd")
+        display_icon = m.get("displayIcon")
+        uuid = m.get("uuid")
         if xm is None or ym is None or xs is None or ys is None:
             continue
         out[name] = {
@@ -109,8 +122,29 @@ def _fetch_map_transforms_from_valorant_api() -> dict[str, Any]:
             "yMultiplier": ym,
             "xScalarToAdd": xs,
             "yScalarToAdd": ys,
+            "displayIcon": display_icon,
+            "uuid": uuid,
         }
     return out
+
+
+def _find_transform_by_display_icon(transforms: dict[str, Any], display_icon_url: str | None) -> dict | None:
+    """Find transform by matching displayIcon URL or UUID extracted from it."""
+    if not display_icon_url or not transforms:
+        return None
+    # Extract UUID from URL: https://media.valorant-api.com/maps/{uuid}/displayicon.png
+    import re
+    match = re.search(r'/maps/([a-f0-9-]+)/', display_icon_url)
+    if match:
+        target_uuid = match.group(1)
+        for map_name, t in transforms.items():
+            if t.get("uuid") == target_uuid:
+                return t
+    # Fallback: match by full URL
+    for map_name, t in transforms.items():
+        if t.get("displayIcon") == display_icon_url:
+            return t
+    return None
 
 # Agent name mapping for folder names
 AGENT_FOLDER_MAP = {
@@ -388,7 +422,7 @@ def main():
         st.markdown("### Navigation")
         page = st.radio(
             "",
-            ["📊 Dashboard", "🎮 Matches", "📈 Statistics", "🎬 Replay", "🤖 Coach", "⚙️ Settings"],
+            ["📊 Dashboard", "🎮 Matches", "📈 Statistics", "🎬 Replay", "🤖 Coach", "🛠️ Manage", "⚙️ Settings"],
             label_visibility="collapsed",
         )
     
@@ -402,6 +436,8 @@ def main():
         show_replay()
     elif "Coach" in page:
         show_coach()
+    elif "Manage" in page:
+        show_manage()
     elif "Settings" in page:
         show_settings()
 
@@ -433,8 +469,11 @@ def show_dashboard():
     
     # Recent matches with visual cards
     st.subheader("Recent Matches")
-    
-    recent = session.query(Match).order_by(
+
+    recent = session.query(Match).filter(
+        Match.is_hidden == False,  # noqa: E712
+        _custom_match_filter(),
+    ).order_by(
         Match.created_at.desc()
     ).limit(5).all()
     
@@ -487,17 +526,21 @@ def show_dashboard():
 def show_matches():
     """Show matches list with detailed stats."""
     st.header("Match History")
-    
+
     session = next(get_session())
-    
-    matches = session.query(Match).order_by(
+
+    # Filter out hidden matches and non-custom matches
+    matches = session.query(Match).filter(
+        Match.is_hidden == False,  # noqa: E712
+        _custom_match_filter(),
+    ).order_by(
         Match.created_at.desc()
     ).all()
-    
+
     if not matches:
-        st.info("No matches found.")
+        st.info("No custom matches found. (Manage in 🛠️ Manage)")
         return
-    
+
     for match in matches:
         result = match.result.value if match.result else "Unknown"
         result_emoji = "✅" if result == "Win" else "❌" if result == "Lose" else "➖"
@@ -599,6 +642,10 @@ def render_stats_table(players):
         # FK diff display
         fk_display = f"+{fk_diff}" if fk_diff > 0 else str(fk_diff)
                     
+        # KAST calculation
+        kast_rounds = p.kast_rounds or 0
+        kast_pct = round(kast_rounds / rounds * 100, 0) if rounds > 0 else 0
+
         data.append({
             "icon_b64": icon_b64,
             "player_name": p.player_name or "Unknown",
@@ -615,131 +662,218 @@ def render_stats_table(players):
             "fk_display": fk_display,
             "tfk": p.true_first_kills or 0,
             "hs_pct": hs_pct,
+            "kast_pct": kast_pct,
         })
     
     # Display as styled columns
-    cols = st.columns([3, 1, 2, 1, 1, 1, 1, 1, 1, 1])
-    headers = ["Player", "ACS", "K/D/A", "KD", "ADR", "FK", "FD", "±FK", "TFK", "HS%"]
+    cols = st.columns([3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1])
+    headers = ["Player", "ACS", "K/D/A", "KD", "ADR", "KAST", "FK", "FD", "±FK", "TFK", "HS%"]
     for col, header in zip(cols, headers):
         col.markdown(f"**{header}**")
     
     for p in data:
-        cols = st.columns([3, 1, 2, 1, 1, 1, 1, 1, 1, 1])
-        
+        cols = st.columns([3, 1, 2, 1, 1, 1, 1, 1, 1, 1, 1])
+
         # Player with icon
         with cols[0]:
             icon_html = f'<img src="data:image/webp;base64,{p["icon_b64"]}" style="width:28px;height:28px;border-radius:50%;vertical-align:middle;margin-right:8px;">' if p["icon_b64"] else ""
             st.markdown(f'{icon_html}<span style="font-weight:600;">{p["player_name"]}</span><br><span style="font-size:0.8em;color:#64748b;">{p["agent_name"]}</span>', unsafe_allow_html=True)
-        
+
         # ACS
         cols[1].markdown(f'<span style="color:#7c3aed;font-weight:bold;">{p["acs"]}</span>', unsafe_allow_html=True)
-        
+
         # K/D/A
         cols[2].markdown(f'<span style="color:#0d9488;">{p["kills"]}</span> / <span style="color:#ff4655;">{p["deaths"]}</span> / <span style="color:#d97706;">{p["assists"]}</span>', unsafe_allow_html=True)
-        
+
         # KD
         cols[3].write(f'{p["kd"]:.2f}')
-        
+
         # ADR
         cols[4].write(f'{p["adr"]:.1f}')
-        
+
+        # KAST
+        kast_color = "#0d9488" if p["kast_pct"] >= 70 else "#d97706" if p["kast_pct"] >= 50 else "#ff4655"
+        cols[5].markdown(f'<span style="color:{kast_color};font-weight:600;">{int(p["kast_pct"])}%</span>', unsafe_allow_html=True)
+
         # FK
-        cols[5].write(str(p["fk"]))
-        
+        cols[6].write(str(p["fk"]))
+
         # FD
-        cols[6].write(str(p["fd"]))
-        
+        cols[7].write(str(p["fd"]))
+
         # ±FK
         fk_color = "#0d9488" if p["fk_diff"] > 0 else "#ff4655" if p["fk_diff"] < 0 else "#94a3b8"
-        cols[7].markdown(f'<span style="color:{fk_color};font-weight:600;">{p["fk_display"]}</span>', unsafe_allow_html=True)
-        
+        cols[8].markdown(f'<span style="color:{fk_color};font-weight:600;">{p["fk_display"]}</span>', unsafe_allow_html=True)
+
         # TFK
-        cols[8].write(str(p["tfk"]))
-        
+        cols[9].write(str(p["tfk"]))
+
         # HS%
         hs_color = "#0d9488" if p["hs_pct"] >= 25 else "#d97706" if p["hs_pct"] >= 15 else "#94a3b8"
-        cols[9].markdown(f'<span style="color:{hs_color};font-weight:600;">{p["hs_pct"]:.1f}%</span>', unsafe_allow_html=True)
+        cols[10].markdown(f'<span style="color:{hs_color};font-weight:600;">{p["hs_pct"]:.1f}%</span>', unsafe_allow_html=True)
 
 
 def render_time_kd_table(players):
-    """Render time-based K/D table."""
-    st.caption("1st (0-20s) | 1.5th (20-40s) | 2nd (40-60s) | Late (60s+) | PP (Post Plant)")
+    """Render time-based K/D with visual bars using components.html."""
     
-    data = []
+    # Time zone labels
+    zones = ["1st", "1.5th", "2nd", "Late", "PP"]
+    zone_labels = {
+        "1st": "0-20s",
+        "1.5th": "20-40s",
+        "2nd": "40-60s",
+        "Late": "60s+",
+        "PP": "Post Plant",
+    }
+    
+    # Collect data
+    player_data = []
+    max_kills = 1
+    max_deaths = 1
+    
     for p in players:
         try:
             tkd = json.loads(p.time_based_kd) if p.time_based_kd else {}
-        except:
+        except Exception:
             tkd = {}
         
-        def fmt_zone(zone):
-            z = tkd.get(zone, {})
+        zone_data = {}
+        for zone_key in zones:
+            z = tkd.get(zone_key, {})
             k, d = z.get("k", 0), z.get("d", 0)
-            return f"{k}/{d}"
+            zone_data[zone_key] = {"k": k, "d": d}
+            max_kills = max(max_kills, k)
+            max_deaths = max(max_deaths, d)
         
-        data.append({
-            "Player": p.player_name or "Unknown",
-            "1st": fmt_zone("1st"),
-            "1.5th": fmt_zone("1.5th"),
-            "2nd": fmt_zone("2nd"),
-            "Late": fmt_zone("Late"),
-            "PP": fmt_zone("PP"),
+        # Get agent icon
+        icon_path = get_agent_icon_path(p.agent_name)
+        icon_b64 = image_to_base64(icon_path)
+        
+        player_data.append({
+            "name": (p.player_name or "Unknown")[:12],
+            "agent": p.agent_name or "Unknown",
+            "icon_b64": icon_b64,
+            "is_ally": p.is_ally,
+            "zones": zone_data,
         })
     
     # Check if there's any data
     has_data = any(
-        row["1st"] != "0/0" or row["1.5th"] != "0/0" or 
-        row["2nd"] != "0/0" or row["Late"] != "0/0" or row["PP"] != "0/0"
-        for row in data
+        any(pd["zones"][z]["k"] > 0 or pd["zones"][z]["d"] > 0 for z in zones)
+        for pd in player_data
     )
     
-    if has_data:
-        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
-    else:
+    if not has_data:
         st.info("Time-based K/D data not available for this match.")
+        return
+    
+    # Build complete HTML
+    rows_html = ""
+    for pd in player_data:
+        team_color = "#0ea5e9" if pd["is_ally"] else "#ff4655"
+        
+        # Build zone cells
+        zone_cells = ""
+        for zone_key in zones:
+            z = pd["zones"][zone_key]
+            k, d = z["k"], z["d"]
+            
+            # Calculate bar widths (percentage of max)
+            k_width = int(k / max_kills * 100) if max_kills > 0 else 0
+            d_width = int(d / max_deaths * 100) if max_deaths > 0 else 0
+            
+            zone_cells += f'''
+            <div class="zone-cell">
+                <div class="bar-row">
+                    <span class="bar-label kill">K</span>
+                    <div class="bar-bg"><div class="bar-fill kill" style="width:{k_width}%"></div></div>
+                    <span class="bar-value kill">{k}</span>
+                </div>
+                <div class="bar-row">
+                    <span class="bar-label death">D</span>
+                    <div class="bar-bg"><div class="bar-fill death" style="width:{d_width}%"></div></div>
+                    <span class="bar-value death">{d}</span>
+                </div>
+            </div>
+            '''
+        
+        # Player icon
+        icon_html = f'<img src="data:image/webp;base64,{pd["icon_b64"]}" class="player-icon" style="border-color:{team_color};">' if pd["icon_b64"] else '<div class="player-icon-placeholder"></div>'
+        
+        rows_html += f'''
+        <div class="player-row">
+            <div class="player-info">
+                {icon_html}
+                <div class="player-name-wrap">
+                    <div class="player-name">{pd["name"]}</div>
+                    <div class="player-agent">{pd["agent"]}</div>
+                </div>
+            </div>
+            {zone_cells}
+        </div>
+        '''
+    
+    # Zone headers
+    zone_headers = "".join(f'<div class="zone-header"><div class="zone-title">{z}</div><div class="zone-subtitle">{zone_labels[z]}</div></div>' for z in zones)
+    
+    html = f'''
+    <style>
+        .tkd-container {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; }}
+        .zone-header-row {{ display:flex; gap:8px; margin-bottom:8px; padding-left:160px; }}
+        .zone-header {{ flex:1; text-align:center; }}
+        .zone-title {{ font-size:12px; font-weight:600; color:#475569; }}
+        .zone-subtitle {{ font-size:10px; color:#94a3b8; }}
+        .player-row {{ display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #e2e8f0; }}
+        .player-info {{ width:150px; display:flex; align-items:center; gap:8px; }}
+        .player-icon {{ width:32px; height:32px; border-radius:50%; border:2px solid; }}
+        .player-icon-placeholder {{ width:32px; height:32px; border-radius:50%; background:#e2e8f0; }}
+        .player-name-wrap {{ overflow:hidden; }}
+        .player-name {{ font-size:13px; font-weight:600; color:#1e293b; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+        .player-agent {{ font-size:10px; color:#64748b; }}
+        .zone-cell {{ flex:1; padding:2px 4px; }}
+        .bar-row {{ display:flex; align-items:center; gap:4px; margin:2px 0; }}
+        .bar-label {{ width:14px; font-size:10px; font-weight:600; }}
+        .bar-label.kill {{ color:#0d9488; }}
+        .bar-label.death {{ color:#ef4444; }}
+        .bar-bg {{ flex:1; height:6px; background:#e2e8f0; border-radius:3px; overflow:hidden; }}
+        .bar-fill {{ height:100%; border-radius:3px; }}
+        .bar-fill.kill {{ background:#0d9488; }}
+        .bar-fill.death {{ background:#ef4444; }}
+        .bar-value {{ width:14px; font-size:11px; font-weight:600; text-align:right; }}
+        .bar-value.kill {{ color:#0d9488; }}
+        .bar-value.death {{ color:#ef4444; }}
+    </style>
+    <div class="tkd-container">
+        <div class="zone-header-row">{zone_headers}</div>
+        {rows_html}
+    </div>
+    '''
+    
+    # Calculate height based on number of players
+    height = 60 + len(player_data) * 52
+    components.html(html, height=height, scrolling=False)
 
 
 def _render_rib_style_map(
     map_name: str,
     positions: list,
     event_data: dict,
-    calibration: dict,
     trace_points: list[dict] | None = None,
     show_names: bool = False,
     lock_view: bool = True,
+    calibration: dict | None = None,  # kept for backwards compat, but ignored
 ):
     """
-    rib.gg 風の2Dマップ描画（マップ画像 + プレイヤー位置 + キル線）。
+    rib.gg / tracker heatmap 風の2Dマップ描画（マップ画像 + プレイヤー位置 + キル線）。
 
-    - positions: import_replay_events.py 形式 or replay_service.py 形式のどちらでも受ける
-      - {"puuid","name","x","y",...} / {"puuid","player_name","x","y","team_id",...}
-    - calibration: flip_y / offset_x / offset_y / scale
+    座標変換は valorant-api.com の公式 transform (xMultiplier/yMultiplier/xScalarToAdd/yScalarToAdd) を使用。
+    マップ画像は valorant-api.com の displayIcon を使用。
+    これにより tracker の heatmap-generator.ts と完全に同じ座標変換が実現される。
     """
-    import base64
 
-    # --- Map image ---
-    # Plotlyのlayout_imageはSVG(base64)が環境によって描画されないことがあるため、
-    # SVGはutf8+URLエンコードでdata URIを作る。無い場合はthumb(webp)へフォールバック。
-    map_source = ""
-    map_svg_path = get_map_svg_path(map_name)
-    if map_svg_path.exists():
-        try:
-            svg_text = map_svg_path.read_text(encoding="utf-8")
-            map_source = "data:image/svg+xml;utf8," + urllib.parse.quote(svg_text)
-        except Exception:
-            map_source = ""
-    if not map_source:
-        thumb_path = get_map_thumbnail_path(map_name)
-        thumb_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
-        if thumb_b64:
-            map_source = f"data:image/webp;base64,{thumb_b64}"
-
-    # --- Coordinate transform (rib.gg/heatmap style) ---
-    # Prefer official map transform (xMultiplier/yMultiplier/xScalarToAdd/yScalarToAdd)
-    # Fallback to bounds-based normalization if transform is unavailable.
+    # --- Load map transforms (with displayIcon URL) ---
     transforms = _load_map_transforms()
     if not transforms:
-        # try fetch once, then persist for next run
         try:
             fetched = _fetch_map_transforms_from_valorant_api()
             if fetched:
@@ -749,58 +883,52 @@ def _render_rib_style_map(
             transforms = {}
 
     t = transforms.get(map_name)
+    
+    # If map_name is Unknown or not found, try to find a default transform
+    # We'll use the first displayIcon and try to match later
+    if not t and transforms:
+        # Use Pearl as a reasonable default for Unknown maps
+        t = transforms.get("Pearl") or next(iter(transforms.values()), None)
 
-    fallback_bounds = {"x_min": -6000.0, "x_max": 8000.0, "y_min": -5000.0, "y_max": 8000.0}
-    b = {
-        "x_min": float(calibration.get("x_min", fallback_bounds["x_min"])),
-        "x_max": float(calibration.get("x_max", fallback_bounds["x_max"])),
-        "y_min": float(calibration.get("y_min", fallback_bounds["y_min"])),
-        "y_max": float(calibration.get("y_max", fallback_bounds["y_max"])),
-    }
+    # --- Map image: use valorant-api.com displayIcon (same as tracker heatmap) ---
+    display_icon_url = t.get("displayIcon") if t else None
+    
+    # If we found a displayIcon, try to find the correct transform by UUID
+    if display_icon_url and (not t or map_name == "Unknown"):
+        found_t = _find_transform_by_display_icon(transforms, display_icon_url)
+        if found_t:
+            t = found_t
+            display_icon_url = t.get("displayIcon")
+    if display_icon_url:
+        img_tag = f'<img id="vt-map" src="{display_icon_url}" crossorigin="anonymous" style="display:block; width:100%; max-width:900px; height:auto;" />'
+    else:
+        # Fallback to local thumbnail if API URL not available
+        thumb_path = get_map_thumbnail_path(map_name)
+        thumb_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
+        if thumb_b64:
+            img_tag = f'<img id="vt-map" src="data:image/webp;base64,{thumb_b64}" style="display:block; width:100%; max-width:900px; height:auto;" />'
+        else:
+            img_tag = '<div style="width:900px;height:520px;background:#f1f5f9;border-radius:12px;"></div>'
 
-    # --- Calibration ---
-    flip_x = bool(calibration.get("flip_x", False))
-    flip_y = bool(calibration.get("flip_y", True))
-    offset_x = float(calibration.get("offset_x", 0.0))
-    offset_y = float(calibration.get("offset_y", 0.0))
-    scale = float(calibration.get("scale", 1.0))
-
-    def _bounds_to_norm(x: float, y: float) -> tuple[float, float]:
-        nx = (x - b["x_min"]) / max((b["x_max"] - b["x_min"]), 1e-9)
-        ny = (y - b["y_min"]) / max((b["y_max"] - b["y_min"]), 1e-9)
-        nx = max(0.0, min(1.0, nx))
-        ny = max(0.0, min(1.0, ny))
-        return nx, ny
-
-    def _game_to_norm(x: float, y: float) -> tuple[float, float]:
-        # Tracker heatmap formula: x = victimLocationY * xMultiplier + xScalarToAdd
-        #                        y = victimLocationX * yMultiplier + yScalarToAdd
+    # --- Coordinate transform (tracker heatmap-generator.ts formula) ---
+    # x_map = victimLocationY * xMultiplier + xScalarToAdd
+    # y_map = victimLocationX * yMultiplier + yScalarToAdd
+    # No flip, no offset, no scale - just pure transform like tracker
+    def _game_to_norm(game_x: float, game_y: float) -> tuple[float, float]:
         if t:
-            nx = (y * float(t["xMultiplier"])) + float(t["xScalarToAdd"])
-            ny = (x * float(t["yMultiplier"])) + float(t["yScalarToAdd"])
+            # Note: X and Y are swapped in the formula (this is correct per tracker)
+            nx = (game_y * float(t["xMultiplier"])) + float(t["xScalarToAdd"])
+            ny = (game_x * float(t["yMultiplier"])) + float(t["yScalarToAdd"])
             nx = max(0.0, min(1.0, nx))
             ny = max(0.0, min(1.0, ny))
             return nx, ny
-        return _bounds_to_norm(x, y)
-
-    def cal_xy(x: float, y: float) -> tuple[float, float]:
-        # Normalize to 0-1 first, then apply small calibration in normalized space.
-        nx, ny = _game_to_norm(x, y)
-        xx = (nx * scale) + (offset_x / 10000.0)
-        yy = (ny * scale) + (offset_y / 10000.0)
-        if flip_x:
-            xx = 1.0 - xx
-        if flip_y:
-            yy = 1.0 - yy
-        xx = max(0.0, min(1.0, xx))
-        yy = max(0.0, min(1.0, yy))
-        return xx, yy
+        # Fallback: simple bounds-based normalization
+        return 0.5, 0.5
 
     killer_puuid = event_data.get("killer") or ""
     victim_puuid = event_data.get("victim") or ""
 
-    # --- Normalize / split teams (暫定) ---
-    # DBに team_id が無い場合があるので、見つからなければ indexで 5/5 に分割
+    # --- Normalize / split teams ---
     norm = []
     for idx, p in enumerate(positions or []):
         puuid = p.get("puuid") or p.get("subject") or ""
@@ -821,7 +949,14 @@ def _render_rib_style_map(
         is_killer = (puuid == killer_puuid) or (killer_puuid and puuid and puuid.startswith(killer_puuid[:8]))
         is_victim = (puuid == victim_puuid) or (victim_puuid and puuid and puuid.startswith(victim_puuid[:8]))
 
-        xx, yy = cal_xy(x, y)
+        # Get agent info from position data
+        agent_name = p.get("agent_name") or "Unknown"
+        
+        # Get agent icon as base64
+        agent_icon_path = get_agent_icon_path(agent_name)
+        agent_icon_b64 = image_to_base64(agent_icon_path) if agent_icon_path.exists() else ""
+
+        xx, yy = _game_to_norm(x, y)
         norm.append(
             {
                 "idx": idx,
@@ -833,28 +968,10 @@ def _render_rib_style_map(
                 "is_alive": is_alive,
                 "is_killer": is_killer,
                 "is_victim": is_victim,
+                "agent_name": agent_name,
+                "agent_icon_b64": agent_icon_b64,
             }
         )
-
-    # --- Build normalized points list (0..1) ---
-
-    # --- Render with HTML (SVG background + absolute overlay), like tracker heatmap ---
-    # This avoids Plotly not rendering SVG layout_image in some environments.
-
-    svg_b64 = ""
-    if map_svg_path.exists():
-        try:
-            svg_b64 = base64.b64encode(map_svg_path.read_bytes()).decode("utf-8")
-        except Exception:
-            svg_b64 = ""
-
-    # Decide which image to show (prefer SVG from assets; fallback to thumb/webp)
-    if svg_b64:
-        img_tag = f'<img id="vt-map" src="data:image/svg+xml;base64,{svg_b64}" style="display:block; width:100%; max-width:900px; height:auto;" />'
-    elif map_source:
-        img_tag = f'<img id="vt-map" src="{map_source}" style="display:block; width:100%; max-width:900px; height:auto;" />'
-    else:
-        img_tag = '<div style="width:900px;height:520px;background:#f1f5f9;border-radius:12px;"></div>'
 
     # Convert trace_points to normalized list
     trace_norm = []
@@ -866,15 +983,13 @@ def _render_rib_style_map(
             except Exception:
                 continue
             team = p.get("team_id") or "blue"
-            xx, yy = cal_xy(x, y)
+            xx, yy = _game_to_norm(x, y)
             trace_norm.append({"x": xx, "y": yy, "team": team})
 
     killer_pt = next((p for p in norm if p["is_killer"]), None)
     victim_pt = next((p for p in norm if p["is_victim"]), None)
 
     payload = {
-        "svg_b64": svg_b64,
-        "fallback_img": map_source,  # may be webp data uri
         "players": [
             {
                 "name": p["name"],
@@ -884,6 +999,8 @@ def _render_rib_style_map(
                 "alive": p["is_alive"],
                 "killer": p["is_killer"],
                 "victim": p["is_victim"],
+                "agent_name": p.get("agent_name", "Unknown"),
+                "agent_icon": p.get("agent_icon_b64", ""),
             }
             for p in norm
         ],
@@ -957,20 +1074,42 @@ def _render_rib_style_map(
         // players
         overlay.innerHTML = '';
         for (const p of (DATA.players || [])) {{
-          const el = document.createElement('div');
           const base = (p.team === 'blue') ? '#0ea5e9' : '#ff4655';
-          const color = p.alive ? base : '#94a3b8';
-          const r = (p.killer || p.victim) ? 8 : 6;
+          const borderColor = p.killer ? '#fbbf24' : (p.victim ? '#ff4655' : base);
+          const iconSize = (p.killer || p.victim) ? 32 : 28;
+          
+          // Container for icon
+          const el = document.createElement('div');
           el.style.position = 'absolute';
           el.style.left = (p.x * 100) + '%';
           el.style.top  = (p.y * 100) + '%';
-          el.style.width = (r*2) + 'px';
-          el.style.height = (r*2) + 'px';
           el.style.transform = 'translate(-50%,-50%)';
-          el.style.borderRadius = '999px';
-          el.style.background = color;
-          el.style.border = '2px solid ' + (p.killer ? '#fbbf24' : (p.victim ? '#ff4655' : base));
-          el.style.boxShadow = p.killer ? '0 0 12px rgba(251,191,36,0.6)' : 'none';
+          
+          if (p.agent_icon) {{
+            // Use agent icon
+            const img = document.createElement('img');
+            img.src = 'data:image/webp;base64,' + p.agent_icon;
+            img.style.width = iconSize + 'px';
+            img.style.height = iconSize + 'px';
+            img.style.borderRadius = '50%';
+            img.style.border = '2px solid ' + borderColor;
+            img.style.boxShadow = p.killer ? '0 0 12px rgba(251,191,36,0.6)' : '0 2px 4px rgba(0,0,0,0.3)';
+            img.style.opacity = p.alive ? '1' : '0.4';
+            img.style.filter = p.alive ? 'none' : 'grayscale(100%)';
+            el.appendChild(img);
+          }} else {{
+            // Fallback to colored circle
+            const circle = document.createElement('div');
+            const color = p.alive ? base : '#94a3b8';
+            const r = (p.killer || p.victim) ? 8 : 6;
+            circle.style.width = (r*2) + 'px';
+            circle.style.height = (r*2) + 'px';
+            circle.style.borderRadius = '999px';
+            circle.style.background = color;
+            circle.style.border = '2px solid ' + borderColor;
+            circle.style.boxShadow = p.killer ? '0 0 12px rgba(251,191,36,0.6)' : 'none';
+            el.appendChild(circle);
+          }}
           overlay.appendChild(el);
 
           if (DATA.show_names) {{
@@ -998,7 +1137,7 @@ def _render_rib_style_map(
     </script>
     """
 
-    components.html(html, height=560, scrolling=False)
+    components.html(html, height=950, scrolling=False)
 
 
 def show_statistics():
@@ -1087,15 +1226,18 @@ def show_statistics():
 def show_replay():
     """Show 2D replay viewer (rib.gg-inspired)."""
     st.header("🎬 2D Replay")
-    
+
     session = next(get_session())
-    
-    # Match selector
-    matches = session.query(Match).order_by(Match.created_at.desc()).all()
+
+    # Match selector (filter out hidden matches and non-custom matches)
+    matches = session.query(Match).filter(
+        Match.is_hidden == False,  # noqa: E712
+        _custom_match_filter(),
+    ).order_by(Match.created_at.desc()).all()
     if not matches:
-        st.info("No matches available for replay.")
+        st.info("No custom matches available for replay. (Manage in 🛠️ Manage)")
         return
-    
+
     match_options = {f"{m.map_name} | {m.ally_score}-{m.enemy_score}": m.match_id for m in matches}
     selected = st.selectbox("Select Match", list(match_options.keys()))
     if not selected:
@@ -1200,13 +1342,42 @@ def show_replay():
             key=f"replay_event_{match_id}_{selected_round}",
         )
 
-    ui1, ui2, ui3 = st.columns([1, 1, 1])
+    ui1, ui2, ui3, ui4 = st.columns([1, 1, 1, 2])
     with ui1:
         show_names = st.checkbox("Show names", value=False, key=f"replay_show_names_{match_id}")
     with ui2:
         show_traces = st.checkbox("Show traces", value=True, key=f"replay_show_traces_{match_id}_{selected_round}")
     with ui3:
         lock_view = st.checkbox("Lock view", value=True, key=f"replay_lock_view_{match_id}")
+    
+    # Map override selector (for Unknown maps or correction)
+    with ui4:
+        # Get available map names from transforms
+        transforms = _load_map_transforms()
+        if not transforms:
+            try:
+                transforms = _fetch_map_transforms_from_valorant_api()
+                if transforms:
+                    _save_map_transforms(transforms)
+            except Exception:
+                transforms = {}
+        
+        available_maps = ["(Auto)"] + sorted([k for k, v in transforms.items() if v.get("displayIcon")])
+        
+        # Default to current map_name if it's valid, otherwise "(Auto)"
+        default_idx = 0
+        if map_name in available_maps:
+            default_idx = available_maps.index(map_name)
+        
+        selected_map_override = st.selectbox(
+            "Map",
+            available_maps,
+            index=default_idx,
+            key=f"replay_map_override_{match_id}",
+        )
+        
+        # Use override if selected, otherwise use original map_name
+        effective_map_name = map_name if selected_map_override == "(Auto)" else selected_map_override
 
     current_event = round_events[event_idx]
 
@@ -1291,129 +1462,17 @@ def show_replay():
     # Layout: map + kill feed
     col_map, col_feed = st.columns([2, 1])
 
-    # Calibration defaults/persistence per map
-    saved = _load_replay_calibration().get(map_name, {}) if map_name else {}
-    # Map-specific default bounds
-    MAP_UI_DEFAULTS = {
-        "Abyss": {"x_min": -5000, "x_max": 5000, "y_min": -4000, "y_max": 2000},
-        "Ascent": {"x_min": -6000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
-        "Bind": {"x_min": -5000, "x_max": 7500, "y_min": -5000, "y_max": 7000},
-        "Haven": {"x_min": -6500, "x_max": 7500, "y_min": -5000, "y_max": 9000},
-        "Split": {"x_min": -6000, "x_max": 7000, "y_min": -5500, "y_max": 7500},
-        "Icebox": {"x_min": -5000, "x_max": 7000, "y_min": -5000, "y_max": 7000},
-        "Breeze": {"x_min": -7000, "x_max": 9000, "y_min": -6000, "y_max": 9000},
-        "Fracture": {"x_min": -7000, "x_max": 7000, "y_min": -7000, "y_max": 7000},
-        "Pearl": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
-        "Lotus": {"x_min": -7000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
-        "Sunset": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
-        "Corrode": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
-    }
-    default_b = MAP_UI_DEFAULTS.get(map_name, {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000})
-    # Bounds (image placement + axis range) + affine (flip/offset/scale)
-    # Start with saved values, else map-specific defaults.
-    b_xmin = float(saved.get("x_min", default_b["x_min"]))
-    b_xmax = float(saved.get("x_max", default_b["x_max"]))
-    b_ymin = float(saved.get("y_min", default_b["y_min"]))
-    b_ymax = float(saved.get("y_max", default_b["y_max"]))
-    flip_x = bool(saved.get("flip_x", False))
-    # When using official map transforms (xMultiplier/...), Y is already in "top-origin" space.
-    # So default flip_y should be False unless user saved otherwise.
-    flip_y = bool(saved.get("flip_y", False))
-    offset_x = float(saved.get("offset_x", 0.0))
-    offset_y = float(saved.get("offset_y", 0.0))
-    scale = float(saved.get("scale", 1.0))
-
-    with st.expander("🧭 Abyss キャリブレーション（rib.gg合わせ込み）", expanded=(map_name == "Abyss")):
-        st.caption("まずは Abyss を合わせて、合ったら Save で固定化してください。")
-        st.caption("✨ Auto-fit: この試合の座標分布からboundsを推定して、点群がマップ全体に収まる初期値を自動生成します。")
-        cA, cB, cC, cD = st.columns(4)
-        with cA:
-            b_xmin = st.number_input("x_min", value=b_xmin, step=100.0, key=f"cal_xmin_{map_name}")
-            b_ymin = st.number_input("y_min", value=b_ymin, step=100.0, key=f"cal_ymin_{map_name}")
-        with cB:
-            b_xmax = st.number_input("x_max", value=b_xmax, step=100.0, key=f"cal_xmax_{map_name}")
-            b_ymax = st.number_input("y_max", value=b_ymax, step=100.0, key=f"cal_ymax_{map_name}")
-        with cC:
-            flip_x = st.checkbox("Flip X", value=flip_x, key=f"cal_flipx_{map_name}")
-            flip_y = st.checkbox("Flip Y", value=flip_y, key=f"cal_flipy_{map_name}")
-        with cD:
-            scale = st.number_input("Scale", value=scale, step=0.05, key=f"cal_scale_{map_name}")
-            offset_x = st.number_input("Offset X", value=offset_x, step=100.0, key=f"cal_offx_{map_name}")
-            offset_y = st.number_input("Offset Y", value=offset_y, step=100.0, key=f"cal_offy_{map_name}")
-
-        cS, cR = st.columns([1, 1])
-        with cS:
-            if st.button("💾 Save calibration", type="primary", key=f"cal_save_{map_name}"):
-                _save_replay_calibration(
-                    map_name,
-                    {
-                        "x_min": b_xmin,
-                        "x_max": b_xmax,
-                        "y_min": b_ymin,
-                        "y_max": b_ymax,
-                        "flip_x": flip_x,
-                        "flip_y": flip_y,
-                        "offset_x": offset_x,
-                        "offset_y": offset_y,
-                        "scale": scale,
-                    },
-                )
-                st.success("Saved. 次回から自動で適用されます。")
-        with cR:
-            if st.button("↩️ Reset (unsaved)", key=f"cal_reset_{map_name}"):
-                b_xmin = float(default_b["x_min"])
-                b_xmax = float(default_b["x_max"])
-                b_ymin = float(default_b["y_min"])
-                b_ymax = float(default_b["y_max"])
-                flip_x, flip_y = False, True
-                offset_x, offset_y, scale = 0.0, 0.0, 1.0
-
-        if st.button("✨ Auto-fit bounds from replay data", key=f"cal_autofit_{map_name}"):
-            xs, ys = _collect_xy_from_events(events)
-            if len(xs) < 100:
-                st.warning("座標サンプルが少ないため、自動推定が荒い可能性があります（イベントが少ない/欠損の可能性）。")
-            if xs and ys:
-                xs_s = sorted(xs)
-                ys_s = sorted(ys)
-                # robust range to avoid outliers
-                x_lo = _percentile(xs_s, 0.02)
-                x_hi = _percentile(xs_s, 0.98)
-                y_lo = _percentile(ys_s, 0.02)
-                y_hi = _percentile(ys_s, 0.98)
-                # pad 12%
-                x_pad = (x_hi - x_lo) * 0.12
-                y_pad = (y_hi - y_lo) * 0.12
-                b_xmin = float(x_lo - x_pad)
-                b_xmax = float(x_hi + x_pad)
-                b_ymin = float(y_lo - y_pad)
-                b_ymax = float(y_hi + y_pad)
-                # keep current flip/offset/scale; if nothing saved, keep typical defaults
-                if not saved:
-                    flip_x, flip_y = False, True
-                    offset_x, offset_y, scale = 0.0, 0.0, 1.0
-                st.success(f"Auto-fit完了: x[{b_xmin:.0f},{b_xmax:.0f}] y[{b_ymin:.0f},{b_ymax:.0f}]")
-        else:
-                st.error("座標データを抽出できませんでした（player_positionsが空/壊れている可能性）。")
+    # Note: Calibration UI removed - now using valorant-api.com official transforms
+    # which match the tracker heatmap-generator.ts exactly.
 
     with col_map:
         _render_rib_style_map(
-            map_name=map_name,
+            map_name=effective_map_name,
             positions=positions,
             event_data=event_data,
             trace_points=trace_points,
             show_names=show_names,
             lock_view=lock_view,
-            calibration={
-                "x_min": b_xmin,
-                "x_max": b_xmax,
-                "y_min": b_ymin,
-                "y_max": b_ymax,
-                "flip_x": flip_x,
-                "flip_y": flip_y,
-                "offset_x": offset_x,
-                "offset_y": offset_y,
-                "scale": scale,
-            },
         )
 
     with col_feed:
@@ -1462,12 +1521,15 @@ def show_coach():
     
     # Simplified coach page
     session = next(get_session())
-    matches = session.query(Match).order_by(Match.created_at.desc()).all()
-    
+    matches = session.query(Match).filter(
+        Match.is_hidden == False,  # noqa: E712
+        _custom_match_filter(),
+    ).order_by(Match.created_at.desc()).all()
+
     if not matches:
-        st.info("No matches available for analysis.")
+        st.info("No custom matches available for analysis. (Manage in 🛠️ Manage)")
         return
-    
+
     match_options = {f"{m.map_name} | {m.ally_score}-{m.enemy_score}": m.match_id for m in matches}
     selected = st.selectbox("Select Match to Analyze", list(match_options.keys()))
     
@@ -1479,6 +1541,130 @@ def show_coach():
         
         Configure LLM settings in the sidebar to enable AI analysis.
         """)
+
+
+def show_manage():
+    """Show match management page."""
+    st.header("🛠️ Match Management")
+    
+    session = next(get_session())
+    
+    # Get all matches (including hidden)
+    all_matches = session.query(Match).order_by(Match.created_at.desc()).all()
+    
+    if not all_matches:
+        st.info("No matches to manage.")
+        return
+    
+    # Filter options
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        filter_option = st.selectbox(
+            "Show",
+            ["All", "Visible only", "Hidden only"],
+            key="manage_filter"
+        )
+    
+    if filter_option == "Visible only":
+        matches = [m for m in all_matches if not m.is_hidden]
+    elif filter_option == "Hidden only":
+        matches = [m for m in all_matches if m.is_hidden]
+    else:
+        matches = all_matches
+    
+    st.caption(f"Showing {len(matches)} of {len(all_matches)} matches")
+    
+    if not matches:
+        st.info("No matches match the current filter.")
+        return
+    
+    # Match table with actions
+    for match in matches:
+        created = match.created_at.strftime('%Y-%m-%d %H:%M') if match.created_at else 'N/A'
+        status_icon = "🙈" if match.is_hidden else "👁️"
+        
+        with st.container():
+            cols = st.columns([0.5, 2, 1.5, 1, 1, 1, 1])
+            
+            with cols[0]:
+                st.write(status_icon)
+            with cols[1]:
+                st.write(f"**{match.map_name}**")
+            with cols[2]:
+                st.write(f"`{match.match_id[:20]}...`")
+            with cols[3]:
+                st.write(f"{match.ally_score} - {match.enemy_score}")
+            with cols[4]:
+                st.write(created)
+            with cols[5]:
+                # Toggle visibility button
+                btn_label = "Show" if match.is_hidden else "Hide"
+                if st.button(btn_label, key=f"toggle_{match.match_id}", use_container_width=True):
+                    match.is_hidden = not match.is_hidden
+                    session.commit()
+                    st.rerun()
+            with cols[6]:
+                # Delete button
+                if st.button("🗑️", key=f"delete_{match.match_id}", use_container_width=True):
+                    st.session_state[f"confirm_delete_{match.match_id}"] = True
+            
+            # Delete confirmation
+            if st.session_state.get(f"confirm_delete_{match.match_id}"):
+                st.warning(f"⚠️ Delete match {match.match_id[:12]}... permanently?")
+                c1, c2, c3 = st.columns([1, 1, 2])
+                with c1:
+                    if st.button("Yes, delete", key=f"confirm_yes_{match.match_id}", type="primary"):
+                        session.delete(match)
+                        session.commit()
+                        del st.session_state[f"confirm_delete_{match.match_id}"]
+                        st.rerun()
+                with c2:
+                    if st.button("Cancel", key=f"confirm_no_{match.match_id}"):
+                        del st.session_state[f"confirm_delete_{match.match_id}"]
+                        st.rerun()
+            
+            st.divider()
+    
+    # Bulk actions
+    st.subheader("Bulk Actions")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("Hide All Visible", use_container_width=True):
+            for m in all_matches:
+                if not m.is_hidden:
+                    m.is_hidden = True
+            session.commit()
+            st.rerun()
+    
+    with col2:
+        if st.button("Show All Hidden", use_container_width=True):
+            for m in all_matches:
+                if m.is_hidden:
+                    m.is_hidden = False
+            session.commit()
+            st.rerun()
+    
+    with col3:
+        if st.button("🗑️ Delete All Hidden", type="secondary", use_container_width=True):
+            st.session_state["confirm_delete_all_hidden"] = True
+    
+    if st.session_state.get("confirm_delete_all_hidden"):
+        hidden_count = len([m for m in all_matches if m.is_hidden])
+        st.warning(f"⚠️ Delete {hidden_count} hidden matches permanently?")
+        c1, c2, c3 = st.columns([1, 1, 2])
+        with c1:
+            if st.button("Yes, delete all", key="confirm_delete_all_yes", type="primary"):
+                for m in all_matches:
+                    if m.is_hidden:
+                        session.delete(m)
+                session.commit()
+                del st.session_state["confirm_delete_all_hidden"]
+                st.rerun()
+        with c2:
+            if st.button("Cancel", key="confirm_delete_all_no"):
+                del st.session_state["confirm_delete_all_hidden"]
+                st.rerun()
 
 
 def show_settings():

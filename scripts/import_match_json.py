@@ -64,6 +64,7 @@ MAP_NAMES = {
     "HURM_Yard": "Drift",
     "HURM_Helix": "Piazza",
     "Corro": "Corrode",
+    "Rook": "Corrode",  # Rook is internal name for Corrode
 }
 
 def get_map_name(map_id: str) -> str:
@@ -84,12 +85,13 @@ def get_agent_name(agent_id: str) -> str:
     return AGENT_NAMES.get(agent_id, f"Unknown ({agent_id[:8]})")
 
 def calculate_detailed_stats(match_data: dict) -> dict:
-    """Calculate FK, FD, TrueFK, HS%, time-based K/D."""
+    """Calculate FK, FD, TrueFK, HS%, time-based K/D, and KAST."""
     players = match_data.get("players", [])
     rounds = match_data.get("roundResults", [])
     
     # Build player team map
     player_teams = {p.get("subject"): p.get("teamId") for p in players}
+    all_puuids = set(player_teams.keys())
     
     # Initialize stats
     stats = defaultdict(lambda: {
@@ -99,6 +101,8 @@ def calculate_detailed_stats(match_data: dict) -> dict:
         "headshots": 0,
         "bodyshots": 0,
         "legshots": 0,
+        "kast_rounds": 0,
+        "rounds_played": 0,
         "time_based_kd": {
             "1st": {"k": 0, "d": 0},
             "1.5th": {"k": 0, "d": 0},
@@ -108,6 +112,8 @@ def calculate_detailed_stats(match_data: dict) -> dict:
         },
     })
     
+    TRADE_WINDOW_MS = 5000  # 5 seconds for trade
+    
     for r in rounds:
         winning_team = r.get("winningTeam", "")
         plant_time = r.get("plantRoundTime")
@@ -116,8 +122,15 @@ def calculate_detailed_stats(match_data: dict) -> dict:
         first_killer = None
         first_victim = None
         
+        # Collect all kills in this round with timing
+        round_kills = []  # [(time, killer, victim), ...]
+        round_killers = set()
+        round_assisters = set()
+        round_deaths = set()
+        
         for ps in r.get("playerStats", []):
             puuid = ps.get("subject", "")
+            stats[puuid]["rounds_played"] += 1
             
             # Headshot stats from damage
             for dmg in ps.get("damage", []):
@@ -130,6 +143,16 @@ def calculate_detailed_stats(match_data: dict) -> dict:
                 round_time = kill.get("roundTime", 0)
                 killer = kill.get("killer", "")
                 victim = kill.get("victim", "")
+                assistants = kill.get("assistants", []) or []
+                
+                round_kills.append((round_time, killer, victim))
+                if killer:
+                    round_killers.add(killer)
+                if victim:
+                    round_deaths.add(victim)
+                for assist in assistants:
+                    if assist:
+                        round_assisters.add(assist)
                 
                 if round_time < first_kill_time:
                     first_kill_time = round_time
@@ -142,6 +165,36 @@ def calculate_detailed_stats(match_data: dict) -> dict:
                     stats[killer]["time_based_kd"][zone]["k"] += 1
                 if victim in stats:
                     stats[victim]["time_based_kd"][zone]["d"] += 1
+        
+        # Calculate trades (victim was traded if their killer died within TRADE_WINDOW_MS)
+        round_kills_sorted = sorted(round_kills, key=lambda x: x[0])
+        traded_players = set()
+        
+        for i, (death_time, killer, victim) in enumerate(round_kills_sorted):
+            if not victim or not killer:
+                continue
+            # Check if killer died within trade window after this kill
+            for j in range(i + 1, len(round_kills_sorted)):
+                later_time, later_killer, later_victim = round_kills_sorted[j]
+                if later_time - death_time > TRADE_WINDOW_MS:
+                    break
+                if later_victim == killer:
+                    # The killer was traded - original victim gets trade credit
+                    traded_players.add(victim)
+                    break
+        
+        # Survivors = players who participated but didn't die
+        round_survivors = all_puuids - round_deaths
+        
+        # Calculate KAST for each player
+        for puuid in all_puuids:
+            has_k = puuid in round_killers
+            has_a = puuid in round_assisters
+            has_s = puuid in round_survivors
+            has_t = puuid in traded_players
+            
+            if has_k or has_a or has_s or has_t:
+                stats[puuid]["kast_rounds"] += 1
         
         # Record FK/FD
         if first_killer and first_victim:
@@ -308,6 +361,7 @@ def import_match(json_path: str):
             headshots=player_detailed.get("headshots", 0),
             bodyshots=player_detailed.get("bodyshots", 0),
             legshots=player_detailed.get("legshots", 0),
+            kast_rounds=player_detailed.get("kast_rounds", 0),
             time_based_kd=json.dumps(player_detailed.get("time_based_kd", {})),
         )
         session.add(player_stats)
