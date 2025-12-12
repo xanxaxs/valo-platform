@@ -653,9 +653,17 @@ def _render_rib_style_map(map_name: str, positions: list, event_data: dict, cali
     import base64
     import plotly.graph_objects as go
 
-    # --- Map image (thumbnail) ---
-    thumb_path = get_map_thumbnail_path(map_name)
-    thumb_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
+    # --- Map image (full SVG) ---
+    map_svg_path = get_map_svg_path(map_name)
+    if map_svg_path.exists():
+        with open(map_svg_path, "rb") as f:
+            map_b64 = base64.b64encode(f.read()).decode("utf-8")
+        map_mime = "image/svg+xml"
+    else:
+        # Fallback to thumbnail if SVG not found
+        thumb_path = get_map_thumbnail_path(map_name)
+        map_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
+        map_mime = "image/webp"
 
     # --- Bounds (image placement + axis range) ---
     default_bounds = {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000}
@@ -725,10 +733,10 @@ def _render_rib_style_map(map_name: str, positions: list, event_data: dict, cali
     fig = go.Figure()
 
     # Background map image: stretch to bounds
-    if thumb_b64:
+    if map_b64:
         fig.add_layout_image(
             dict(
-                source=f"data:image/webp;base64,{thumb_b64}",
+                source=f"data:{map_mime};base64,{map_b64}",
                 x=b["x_min"],
                 y=b["y_max"],
                 xref="x",
