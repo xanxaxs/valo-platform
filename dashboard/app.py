@@ -9,6 +9,7 @@ from pathlib import Path
 import json
 import base64
 from typing import Any
+import math
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -963,6 +964,46 @@ def show_replay():
         st.warning("⚠️ No replay data available for this match.")
         return
 
+    # --- Auto-fit helpers (data-driven bounds suggestion) ---
+    def _collect_xy_from_events(evts: list[MatchEventSnapshot]) -> tuple[list[float], list[float]]:
+        xs: list[float] = []
+        ys: list[float] = []
+        for e in evts:
+            positions = e.player_positions or []
+            if isinstance(positions, str):
+                try:
+                    positions = json.loads(positions)
+                except Exception:
+                    continue
+            if not isinstance(positions, list):
+                continue
+            for p in positions:
+                try:
+                    x = float(p.get("x"))
+                    y = float(p.get("y"))
+                except Exception:
+                    continue
+                if math.isfinite(x) and math.isfinite(y):
+                    xs.append(x)
+                    ys.append(y)
+        return xs, ys
+
+    def _percentile(sorted_vals: list[float], q: float) -> float:
+        """q in [0,1]. Linear interpolation on sorted list."""
+        if not sorted_vals:
+            return 0.0
+        if q <= 0:
+            return float(sorted_vals[0])
+        if q >= 1:
+            return float(sorted_vals[-1])
+        idx = (len(sorted_vals) - 1) * q
+        lo = int(math.floor(idx))
+        hi = int(math.ceil(idx))
+        if lo == hi:
+            return float(sorted_vals[lo])
+        w = idx - lo
+        return float(sorted_vals[lo] * (1 - w) + sorted_vals[hi] * w)
+
     # We drive the replay from kill events (they include playerLocations)
     kill_events = [e for e in events if e.event_type == EventType.KILL]
     if not kill_events:
@@ -1081,6 +1122,7 @@ def show_replay():
 
     with st.expander("🧭 Abyss キャリブレーション（rib.gg合わせ込み）", expanded=(map_name == "Abyss")):
         st.caption("まずは Abyss を合わせて、合ったら Save で固定化してください。")
+        st.caption("✨ Auto-fit: この試合の座標分布からboundsを推定して、点群がマップ全体に収まる初期値を自動生成します。")
         cA, cB, cC, cD = st.columns(4)
         with cA:
             b_xmin = st.number_input("x_min", value=b_xmin, step=100.0, key=f"cal_xmin_{map_name}")
@@ -1122,6 +1164,33 @@ def show_replay():
                 b_ymax = float(default_b["y_max"])
                 flip_x, flip_y = False, True
                 offset_x, offset_y, scale = 0.0, 0.0, 1.0
+
+        if st.button("✨ Auto-fit bounds from replay data", key=f"cal_autofit_{map_name}"):
+            xs, ys = _collect_xy_from_events(events)
+            if len(xs) < 100:
+                st.warning("座標サンプルが少ないため、自動推定が荒い可能性があります（イベントが少ない/欠損の可能性）。")
+            if xs and ys:
+                xs_s = sorted(xs)
+                ys_s = sorted(ys)
+                # robust range to avoid outliers
+                x_lo = _percentile(xs_s, 0.02)
+                x_hi = _percentile(xs_s, 0.98)
+                y_lo = _percentile(ys_s, 0.02)
+                y_hi = _percentile(ys_s, 0.98)
+                # pad 12%
+                x_pad = (x_hi - x_lo) * 0.12
+                y_pad = (y_hi - y_lo) * 0.12
+                b_xmin = float(x_lo - x_pad)
+                b_xmax = float(x_hi + x_pad)
+                b_ymin = float(y_lo - y_pad)
+                b_ymax = float(y_hi + y_pad)
+                # keep current flip/offset/scale; if nothing saved, keep typical defaults
+                if not saved:
+                    flip_x, flip_y = False, True
+                    offset_x, offset_y, scale = 0.0, 0.0, 1.0
+                st.success(f"Auto-fit完了: x[{b_xmin:.0f},{b_xmax:.0f}] y[{b_ymin:.0f},{b_ymax:.0f}]")
+            else:
+                st.error("座標データを抽出できませんでした（player_positionsが空/壊れている可能性）。")
 
     with col_map:
         _render_rib_style_map(
