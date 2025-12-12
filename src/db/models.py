@@ -211,7 +211,8 @@ class PlayerMatchStats(Base):
     kills = Column(Integer, default=0)
     deaths = Column(Integer, default=0)
     assists = Column(Integer, default=0)
-    score = Column(Integer, default=0)
+    score = Column(Integer, default=0)  # Combat score total
+    rounds_played = Column(Integer, default=0)
     
     # Damage stats
     damage_dealt = Column(Integer, default=0)
@@ -222,13 +223,135 @@ class PlayerMatchStats(Base):
     bodyshots = Column(Integer, default=0)
     legshots = Column(Integer, default=0)
     
-    # Other
-    first_bloods = Column(Integer, default=0)
+    # First blood stats
+    first_kills = Column(Integer, default=0)  # FK - First Kills
+    first_deaths = Column(Integer, default=0)  # FD - First Deaths
+    true_first_kills = Column(Integer, default=0)  # True FK - FK取得かつラウンド勝利
+    
+    # KAST components (per round tracking)
+    kast_rounds = Column(Integer, default=0)  # Rounds with Kill/Assist/Survive/Trade
+    
+    # Multi-kills
+    multi_kills_2 = Column(Integer, default=0)  # 2K rounds
+    multi_kills_3 = Column(Integer, default=0)  # 3K rounds
+    multi_kills_4 = Column(Integer, default=0)  # 4K rounds
+    multi_kills_5 = Column(Integer, default=0)  # Ace rounds
+    
+    # Clutch stats
+    clutch_wins = Column(Integer, default=0)
+    clutch_attempts = Column(Integer, default=0)
+    
+    # Economy stats
+    avg_loadout_value = Column(Integer, default=0)
+    avg_credits_spent = Column(Integer, default=0)
+    
+    # Legacy fields (for backward compatibility)
+    first_bloods = Column(Integer, default=0)  # Alias for first_kills
     plants = Column(Integer, default=0)
     defuses = Column(Integer, default=0)
+    
+    # Time-based KD (JSON format)
+    # Timing zones based on round time remaining:
+    #   - "1st": 1:40-1:20 (100s-80s remaining)
+    #   - "1.5th": 1:20-1:00 (80s-60s remaining)  
+    #   - "2nd": 1:00-0:40 (60s-40s remaining)
+    #   - "late": 0:40-0:00 (40s-0s remaining)
+    #   - "pp": Post Plant
+    # Format: {"1st": {"k": 0, "d": 0}, "1.5th": {...}, "2nd": {...}, "late": {...}, "pp": {...}}
+    time_based_kd = Column(Text, default="{}")  # JSON string
+    
+    # Round-by-round performance (JSON array)
+    round_performance = Column(Text, default="[]")  # JSON string
 
     # Relationships
     match = relationship("Match", back_populates="player_stats")
+    
+    # Computed properties
+    @property
+    def acs(self) -> float:
+        """Average Combat Score per round."""
+        if self.rounds_played == 0:
+            return 0.0
+        return round(self.score / self.rounds_played, 1)
+    
+    @property
+    def kda(self) -> str:
+        """KDA string."""
+        return f"{self.kills}/{self.deaths}/{self.assists}"
+    
+    @property
+    def kd_ratio(self) -> float:
+        """Kill/Death ratio."""
+        if self.deaths == 0:
+            return float(self.kills)
+        return round(self.kills / self.deaths, 2)
+    
+    @property
+    def fk_fd_diff(self) -> int:
+        """First Kill differential (FK - FD)."""
+        return self.first_kills - self.first_deaths
+    
+    @property
+    def true_fk_rate(self) -> float:
+        """True FK rate - percentage of FKs that resulted in round wins."""
+        if self.first_kills == 0:
+            return 0.0
+        return round((self.true_first_kills / self.first_kills) * 100, 1)
+    
+    @property
+    def kast_percentage(self) -> float:
+        """KAST percentage."""
+        if self.rounds_played == 0:
+            return 0.0
+        return round((self.kast_rounds / self.rounds_played) * 100, 1)
+    
+    @property
+    def headshot_percentage(self) -> float:
+        """Headshot percentage."""
+        total_shots = self.headshots + self.bodyshots + self.legshots
+        if total_shots == 0:
+            return 0.0
+        return round((self.headshots / total_shots) * 100, 1)
+
+
+class RoundPlayerStats(Base):
+    """Per-round player statistics for detailed analysis."""
+    
+    __tablename__ = "round_player_stats"
+    
+    id = Column(String(150), primary_key=True)  # match_id_round_puuid
+    match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False)
+    round_number = Column(Integer, nullable=False)
+    puuid = Column(String(36), nullable=False)
+    
+    # Round outcome for this player
+    kills = Column(Integer, default=0)
+    deaths = Column(Integer, default=0)
+    assists = Column(Integer, default=0)
+    damage_dealt = Column(Integer, default=0)
+    
+    # First engagement
+    is_first_kill = Column(Boolean, default=False)
+    is_first_death = Column(Boolean, default=False)
+    
+    # KAST components
+    got_kill = Column(Boolean, default=False)
+    got_assist = Column(Boolean, default=False)
+    survived = Column(Boolean, default=False)
+    got_traded = Column(Boolean, default=False)  # Died but was traded
+    
+    # Economy
+    loadout_value = Column(Integer, default=0)
+    credits_remaining = Column(Integer, default=0)
+    
+    # Time-based timing zones (based on round time remaining)
+    # "1st" = 1:40-1:20, "1.5th" = 1:20-1:00, "2nd" = 1:00-0:40, "late" = 0:40-0:00, "pp" = post plant
+    kill_timing = Column(String(10), default="")  # "1st", "1.5th", "2nd", "late", "pp"
+    death_timing = Column(String(10), default="")
+    
+    # Round time in seconds when kill/death happened
+    kill_time_seconds = Column(Float, default=0.0)
+    death_time_seconds = Column(Float, default=0.0)
 
 
 class PlayerMapStats(Base):
@@ -440,6 +563,28 @@ class AIFeedback(Base):
 
     # Relationships
     round = relationship("Round", back_populates="ai_feedback")
+
+
+# ============================================
+# Transcript Data
+# ============================================
+
+
+class TranscriptSegment(Base):
+    """Speech transcript segment from audio."""
+    
+    __tablename__ = "transcript_segments"
+    
+    id = Column(String(100), primary_key=True)  # match_id_t{index}
+    match_id = Column(String(36), ForeignKey("matches.match_id"), nullable=False)
+    round_number = Column(Integer, nullable=True)  # May be null for full match
+    start_time = Column(Float, nullable=False)  # Start time in seconds
+    end_time = Column(Float, nullable=False)  # End time in seconds
+    text = Column(Text, nullable=False)
+    speaker = Column(String(50), default="Unknown")
+    confidence = Column(Float, default=0.0)
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 # ============================================

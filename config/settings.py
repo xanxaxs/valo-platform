@@ -15,9 +15,11 @@ from pydantic_settings import BaseSettings
 class AudioSettings(BaseSettings):
     """Audio recording settings."""
     
-    device_name: Optional[str] = Field(default=None, alias="AUDIO_DEVICE_NAME")
+    # MOTU Loopback Mix: マイク(In 1-2) + システム出力(Loopback)をミックスして録音
+    # Discord等の音声も含めて録音するにはLoopback系デバイスを使用
+    device_name: Optional[str] = Field(default="Loopback Mix (MOTU M Series)", alias="AUDIO_DEVICE_NAME")
     sample_rate: int = Field(default=16000, alias="AUDIO_SAMPLE_RATE")
-    channels: int = 1
+    channels: int = 2  # ステレオ（Loopback Mixは2ch）
     
     class Config:
         env_prefix = "AUDIO_"

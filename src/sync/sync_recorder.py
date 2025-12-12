@@ -113,6 +113,48 @@ class SyncRecorder:
     # Recording Control
     # ============================================
     
+    def _resolve_device_id(self, device_name: Optional[str]) -> Optional[int]:
+        """
+        Resolve device name to device ID.
+        
+        Prioritizes WASAPI > DirectSound > MME backends.
+        
+        Args:
+            device_name: Device name to search for
+            
+        Returns:
+            Device ID (int) or None if not found
+        """
+        if device_name is None:
+            return None
+        
+        if not AUDIO_AVAILABLE:
+            return None
+        
+        # Search for matching devices, prioritize by backend
+        matches = []
+        for i, dev in enumerate(sd.query_devices()):
+            if dev["max_input_channels"] > 0 and device_name.lower() in dev["name"].lower():
+                # Determine backend priority (WASAPI > DirectSound > MME)
+                name = dev["name"]
+                if "WASAPI" in name:
+                    priority = 0
+                elif "DirectSound" in name:
+                    priority = 1
+                else:  # MME or other
+                    priority = 2
+                matches.append((priority, i, dev["name"]))
+        
+        if not matches:
+            logger.warning(f"No input device found matching: {device_name}")
+            return None
+        
+        # Sort by priority and return the best match
+        matches.sort(key=lambda x: x[0])
+        best_match = matches[0]
+        logger.info(f"Selected audio device: [{best_match[1]}] {best_match[2]}")
+        return best_match[1]
+    
     def start_recording(self, match_id: str) -> bool:
         """
         Start recording for a match.
@@ -139,12 +181,15 @@ class SyncRecorder:
         self._segments = []
         
         try:
+            # Resolve device name to ID (handles multiple backends)
+            device_id = self._resolve_device_id(self.config.device)
+            
             # Create input stream
             self._stream = sd.InputStream(
                 samplerate=self.config.sample_rate,
                 channels=self.config.channels,
                 dtype=self.config.dtype,
-                device=self.config.device,
+                device=device_id,  # Use resolved ID instead of name
                 callback=self._audio_callback,
                 blocksize=int(self.config.sample_rate * self.config.buffer_duration),
             )

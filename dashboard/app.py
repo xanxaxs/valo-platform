@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 import json
 import base64
+from typing import Any
 
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +26,34 @@ init_db()
 ASSETS_DIR = Path(__file__).parent / "assets"
 AGENTS_DIR = ASSETS_DIR / "agents"
 MAPS_DIR = ASSETS_DIR / "maps"
+
+# Replay calibration persistence
+REPLAY_CALIBRATION_PATH = Path(__file__).parent.parent / "config" / "replay_calibration.json"
+
+
+def _load_replay_calibration() -> dict[str, Any]:
+    """Load per-map replay calibration settings from disk."""
+    try:
+        if REPLAY_CALIBRATION_PATH.exists():
+            with open(REPLAY_CALIBRATION_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+    return {}
+
+
+def _save_replay_calibration(map_name: str, calibration: dict[str, Any]) -> None:
+    """Persist per-map replay calibration settings to disk."""
+    try:
+        REPLAY_CALIBRATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        data = _load_replay_calibration()
+        data[map_name] = calibration
+        with open(REPLAY_CALIBRATION_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # best-effort; UI will still work without persistence
+        pass
 
 # Agent name mapping for folder names
 AGENT_FOLDER_MAP = {
@@ -613,6 +642,176 @@ def render_time_kd_table(players):
         st.info("Time-based K/D data not available for this match.")
 
 
+def _render_rib_style_map(map_name: str, positions: list, event_data: dict, calibration: dict):
+    """
+    rib.gg 風の2Dマップ描画（マップ画像 + プレイヤー位置 + キル線）。
+
+    - positions: import_replay_events.py 形式 or replay_service.py 形式のどちらでも受ける
+      - {"puuid","name","x","y",...} / {"puuid","player_name","x","y","team_id",...}
+    - calibration: flip_y / offset_x / offset_y / scale
+    """
+    import base64
+    import plotly.graph_objects as go
+
+    # --- Map image (thumbnail) ---
+    thumb_path = get_map_thumbnail_path(map_name)
+    thumb_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
+
+    # --- Bounds (image placement + axis range) ---
+    default_bounds = {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000}
+    b = {
+        "x_min": float(calibration.get("x_min", default_bounds["x_min"])),
+        "x_max": float(calibration.get("x_max", default_bounds["x_max"])),
+        "y_min": float(calibration.get("y_min", default_bounds["y_min"])),
+        "y_max": float(calibration.get("y_max", default_bounds["y_max"])),
+    }
+
+    # --- Calibration ---
+    flip_x = bool(calibration.get("flip_x", False))
+    flip_y = bool(calibration.get("flip_y", True))
+    offset_x = float(calibration.get("offset_x", 0.0))
+    offset_y = float(calibration.get("offset_y", 0.0))
+    scale = float(calibration.get("scale", 1.0))
+
+    def cal_xy(x: float, y: float) -> tuple[float, float]:
+        xx = (x * scale) + offset_x
+        yy = (y * scale) + offset_y
+        if flip_x:
+            xx = -xx
+        if flip_y:
+            yy = -yy
+        return xx, yy
+
+    killer_puuid = event_data.get("killer") or ""
+    victim_puuid = event_data.get("victim") or ""
+
+    # --- Normalize / split teams (暫定) ---
+    # DBに team_id が無い場合があるので、見つからなければ indexで 5/5 に分割
+    norm = []
+    for idx, p in enumerate(positions or []):
+        puuid = p.get("puuid") or p.get("subject") or ""
+        name = p.get("name") or p.get("player_name") or puuid[:8] or "Unknown"
+        x = p.get("x")
+        y = p.get("y")
+        if x is None or y is None:
+            continue
+        try:
+            x = float(x)
+            y = float(y)
+        except Exception:
+            continue
+
+        team = p.get("team_id") or ("blue" if idx < 5 else "red")
+        is_alive = bool(p.get("is_alive", True))
+
+        is_killer = (puuid == killer_puuid) or (killer_puuid and puuid and puuid.startswith(killer_puuid[:8]))
+        is_victim = (puuid == victim_puuid) or (victim_puuid and puuid and puuid.startswith(victim_puuid[:8]))
+
+        xx, yy = cal_xy(x, y)
+        norm.append(
+            {
+                "idx": idx,
+                "puuid": puuid,
+                "name": name,
+                "team": team,
+                "x": xx,
+                "y": yy,
+                "is_alive": is_alive,
+                "is_killer": is_killer,
+                "is_victim": is_victim,
+            }
+        )
+
+    fig = go.Figure()
+
+    # Background map image: stretch to bounds
+    if thumb_b64:
+        fig.add_layout_image(
+            dict(
+                source=f"data:image/webp;base64,{thumb_b64}",
+                x=b["x_min"],
+                y=b["y_max"],
+                xref="x",
+                yref="y",
+                sizex=b["x_max"] - b["x_min"],
+                sizey=b["y_max"] - b["y_min"],
+                sizing="stretch",
+                opacity=1.0,
+                layer="below",
+            )
+        )
+
+    # Points
+    def add_player(pt: dict):
+        base_color = "#0ea5e9" if pt["team"] == "blue" else "#ff4655"
+        color = base_color if pt["is_alive"] else "#94a3b8"
+        symbol = "star" if pt["is_killer"] else ("x" if pt["is_victim"] else "circle")
+        size = 18 if (pt["is_killer"] or pt["is_victim"]) else 14
+        line_color = "#fbbf24" if pt["is_killer"] else ("#ff4655" if pt["is_victim"] else base_color)
+        line_w = 3 if (pt["is_killer"] or pt["is_victim"]) else 2
+
+        fig.add_trace(
+            go.Scatter(
+                x=[pt["x"]],
+                y=[pt["y"]],
+                mode="markers+text",
+                marker=dict(size=size, color=color, symbol=symbol, line=dict(color=line_color, width=line_w)),
+                text=[pt["name"][:10]],
+                textposition="top center",
+                textfont=dict(size=10, color=base_color, family="Arial Black"),
+                hovertemplate=(
+                    f"<b>{pt['name']}</b><br>"
+                    f"team: {pt['team']}<br>"
+                    f"x={pt['x']:.0f}, y={pt['y']:.0f}<extra></extra>"
+                ),
+                showlegend=False,
+            )
+        )
+
+    for pt in norm:
+        add_player(pt)
+
+    # Kill line
+    killer_pt = next((p for p in norm if p["is_killer"]), None)
+    victim_pt = next((p for p in norm if p["is_victim"]), None)
+    if killer_pt and victim_pt:
+        fig.add_trace(
+            go.Scatter(
+                x=[killer_pt["x"], victim_pt["x"]],
+                y=[killer_pt["y"], victim_pt["y"]],
+                mode="lines",
+                line=dict(color="#fbbf24", width=2, dash="dot"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    fig.update_layout(
+        height=520,
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_xaxes(
+        range=[b["x_min"], b["x_max"]],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        fixedrange=True,
+    )
+    fig.update_yaxes(
+        range=[b["y_min"], b["y_max"]],
+        showgrid=False,
+        zeroline=False,
+        showticklabels=False,
+        scaleanchor="x",
+        scaleratio=1,
+        fixedrange=True,
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
 def show_statistics():
     """Show player statistics."""
     st.header("Player Statistics")
@@ -697,106 +896,239 @@ def show_statistics():
 
 
 def show_replay():
-    """Show 2D replay viewer."""
+    """Show 2D replay viewer (rib.gg-inspired)."""
     st.header("🎬 2D Replay")
-    
+
     session = next(get_session())
-    
+
     # Match selector
     matches = session.query(Match).order_by(Match.created_at.desc()).all()
-    
     if not matches:
         st.info("No matches available for replay.")
         return
-    
+
     match_options = {f"{m.map_name} | {m.ally_score}-{m.enemy_score}": m.match_id for m in matches}
     selected = st.selectbox("Select Match", list(match_options.keys()))
-    
     if not selected:
         return
-    
+
     match_id = match_options[selected]
     match = session.query(Match).filter(Match.match_id == match_id).first()
-    
-    # Check for replay data
-    from src.db.models import MatchEventSnapshot
+    map_name = match.map_name if match else "Unknown"
+
+    # For team coloring / name resolution (rib.ggっぽく)
+    puuid_to_team: dict[str, str] = {}
+    puuid_to_name: dict[str, str] = {}
+    try:
+        stats_rows = session.query(PlayerMatchStats).filter(PlayerMatchStats.match_id == match_id).all()
+        for s in stats_rows:
+            if s.puuid:
+                puuid_to_team[s.puuid] = "blue" if s.is_ally else "red"
+                if s.player_name:
+                    puuid_to_name[s.puuid] = s.player_name
+    except Exception:
+        pass
+
+    # Replay data
+    from src.db.models import MatchEventSnapshot, EventType
+
     events = session.query(MatchEventSnapshot).filter(
         MatchEventSnapshot.match_id == match_id
-    ).all()
-    
-    # Layout
-    col_map, col_timeline = st.columns([2, 1])
-    
-    with col_map:
-        st.subheader(f"🗺️ {match.map_name if match else 'Map'}")
-        
-        # Load map SVG
-        map_svg_path = get_map_svg_path(match.map_name)
-        map_svg = load_svg(map_svg_path)
-        
-        if map_svg:
-            # Display SVG map
-            st.markdown(f"""
-            <div class="map-container">
-                {map_svg}
+    ).order_by(MatchEventSnapshot.round_number, MatchEventSnapshot.round_time).all()
+
+    if not events:
+        st.warning("⚠️ No replay data available for this match.")
+        return
+
+    # We drive the replay from kill events (they include playerLocations)
+    kill_events = [e for e in events if e.event_type == EventType.KILL]
+    if not kill_events:
+        st.warning("No kill events recorded for this match.")
+        return
+
+    # Controls: round + event slider
+    rounds = sorted(set(e.round_number for e in kill_events))
+
+    c1, c2 = st.columns([1, 4])
+    with c1:
+        selected_round = st.selectbox(
+            "Round",
+            rounds,
+            format_func=lambda r: f"Round {r + 1}",
+            key=f"replay_round_{match_id}",
+        )
+    round_events = [e for e in kill_events if e.round_number == selected_round]
+    if not round_events:
+        st.info("No events for this round.")
+        return
+
+    with c2:
+        event_idx = st.slider(
+            "Event",
+            0,
+            len(round_events) - 1,
+            0,
+            key=f"replay_event_{match_id}_{selected_round}",
+        )
+
+    current_event = round_events[event_idx]
+
+    # Parse event data (db might store dict or json string)
+    event_data = current_event.event_data or {}
+    if isinstance(event_data, str):
+        try:
+            event_data = json.loads(event_data)
+        except Exception:
+            event_data = {}
+
+    # Parse player positions (db might store list/dict or json string)
+    positions = current_event.player_positions or []
+    if isinstance(positions, str):
+        try:
+            positions = json.loads(positions)
+        except Exception:
+            positions = []
+
+    # Patch in names/teams when missing
+    patched_positions = []
+    for i, p in enumerate(positions or []):
+        puuid = p.get("puuid") or p.get("subject") or ""
+        name = p.get("name") or p.get("player_name") or puuid_to_name.get(puuid) or (puuid[:8] if puuid else f"P{i+1}")
+        team_id = p.get("team_id") or puuid_to_team.get(puuid) or ("blue" if i < 5 else "red")
+        patched = dict(p)
+        patched["puuid"] = puuid
+        patched["name"] = name
+        patched["team_id"] = team_id
+        patched_positions.append(patched)
+    positions = patched_positions
+
+    killer = event_data.get("killer_name", (event_data.get("killer") or "?")[:8])
+    victim = event_data.get("victim_name", (event_data.get("victim") or "?")[:8])
+    rt = int((current_event.round_time or 0) // 1000)
+    time_display = f"{rt // 60}:{rt % 60:02d}"
+
+    st.markdown(
+        f"""
+        <div style="background: white; border: 1px solid #e2e8f0; border-radius: 12px; padding: 12px 14px; margin-bottom: 12px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <div style="font-weight:700; color:#1e293b;">Round {selected_round + 1} • {time_display}</div>
+            <div style="font-weight:800;">
+              <span style="color:#0d9488;">{killer}</span>
+              <span style="color:#94a3b8;"> → </span>
+              <span style="color:#ff4655;">{victim}</span>
             </div>
-            """, unsafe_allow_html=True)
-        else:
-            # Fallback to thumbnail
-            thumb_path = get_map_thumbnail_path(match.map_name)
-            if thumb_path.exists():
-                st.image(str(thumb_path), use_container_width=True)
-            else:
-                st.info(f"Map image not found for {match.map_name}")
-        
-        if not events:
-            st.warning("⚠️ No replay data available for this match.")
-            st.caption("Replay snapshots are recorded when full match details are available from the API.")
-    
-    with col_timeline:
-        st.subheader("📋 Timeline")
-        
-        if events:
-            kill_events = [e for e in events if e.event_type == "kill"]
-            
-            # Round filter
-            rounds = sorted(set(e.round_number for e in events if e.round_number))
-            selected_round = st.selectbox(
-                "Round", 
-                ["All"] + [f"Round {r}" for r in rounds],
-            )
-            
-            if selected_round != "All":
-                round_num = int(selected_round.replace("Round ", ""))
-                filtered = [e for e in kill_events if e.round_number == round_num]
-            else:
-                filtered = kill_events[:20]  # Limit
-            
-            for event in filtered:
-                data = event.event_data or {}
-                killer = data.get("killer_name", data.get("killer", "?")[:8])
-                victim = data.get("victim_name", data.get("victim", "?")[:8])
-                
-                st.markdown(f"""
-                <div class="timeline-event">
-                    <strong style="color: #1e293b;">R{event.round_number}</strong> 
-                    <span style="color: #94a3b8;">{event.round_time_display or ''}</span><br>
-                    <span style="color: #0d9488; font-weight: 600;">{killer}</span> 
-                    <span style="color: #94a3b8;">→</span> 
-                    <span style="color: #ff4655; font-weight: 600;">{victim}</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Layout: map + kill feed
+    col_map, col_feed = st.columns([2, 1])
+
+    # Calibration defaults/persistence per map
+    saved = _load_replay_calibration().get(map_name, {}) if map_name else {}
+    # Bounds (image placement + axis range) + affine (flip/offset/scale)
+    # Start with saved values, else reasonable defaults.
+    b_xmin = float(saved.get("x_min", -6000))
+    b_xmax = float(saved.get("x_max", 8000))
+    b_ymin = float(saved.get("y_min", -5000))
+    b_ymax = float(saved.get("y_max", 8000))
+    flip_x = bool(saved.get("flip_x", False))
+    flip_y = bool(saved.get("flip_y", True))
+    offset_x = float(saved.get("offset_x", 0.0))
+    offset_y = float(saved.get("offset_y", 0.0))
+    scale = float(saved.get("scale", 1.0))
+
+    with st.expander("🧭 Abyss キャリブレーション（rib.gg合わせ込み）", expanded=(map_name == "Abyss")):
+        st.caption("まずは Abyss を合わせて、合ったら Save で固定化してください。")
+        cA, cB, cC, cD = st.columns(4)
+        with cA:
+            b_xmin = st.number_input("x_min", value=b_xmin, step=100.0, key=f"cal_xmin_{map_name}")
+            b_ymin = st.number_input("y_min", value=b_ymin, step=100.0, key=f"cal_ymin_{map_name}")
+        with cB:
+            b_xmax = st.number_input("x_max", value=b_xmax, step=100.0, key=f"cal_xmax_{map_name}")
+            b_ymax = st.number_input("y_max", value=b_ymax, step=100.0, key=f"cal_ymax_{map_name}")
+        with cC:
+            flip_x = st.checkbox("Flip X", value=flip_x, key=f"cal_flipx_{map_name}")
+            flip_y = st.checkbox("Flip Y", value=flip_y, key=f"cal_flipy_{map_name}")
+        with cD:
+            scale = st.number_input("Scale", value=scale, step=0.05, key=f"cal_scale_{map_name}")
+            offset_x = st.number_input("Offset X", value=offset_x, step=100.0, key=f"cal_offx_{map_name}")
+            offset_y = st.number_input("Offset Y", value=offset_y, step=100.0, key=f"cal_offy_{map_name}")
+
+        cS, cR = st.columns([1, 1])
+        with cS:
+            if st.button("💾 Save calibration", type="primary", key=f"cal_save_{map_name}"):
+                _save_replay_calibration(
+                    map_name,
+                    {
+                        "x_min": b_xmin,
+                        "x_max": b_xmax,
+                        "y_min": b_ymin,
+                        "y_max": b_ymax,
+                        "flip_x": flip_x,
+                        "flip_y": flip_y,
+                        "offset_x": offset_x,
+                        "offset_y": offset_y,
+                        "scale": scale,
+                    },
+                )
+                st.success("Saved. 次回から自動で適用されます。")
+        with cR:
+            if st.button("↩️ Reset (unsaved)", key=f"cal_reset_{map_name}"):
+                b_xmin, b_xmax, b_ymin, b_ymax = -6000.0, 8000.0, -5000.0, 8000.0
+                flip_x, flip_y = False, True
+                offset_x, offset_y, scale = 0.0, 0.0, 1.0
+
+    with col_map:
+        _render_rib_style_map(
+            map_name=map_name,
+            positions=positions,
+            event_data=event_data,
+            calibration={
+                "x_min": b_xmin,
+                "x_max": b_xmax,
+                "y_min": b_ymin,
+                "y_max": b_ymax,
+                "flip_x": flip_x,
+                "flip_y": flip_y,
+                "offset_x": offset_x,
+                "offset_y": offset_y,
+                "scale": scale,
+            },
+        )
+
+    with col_feed:
+        st.subheader("📋 Kill Feed")
+        for i, e in enumerate(round_events):
+            d = e.event_data or {}
+            if isinstance(d, str):
+                try:
+                    d = json.loads(d)
+                except Exception:
+                    d = {}
+            k = d.get("killer_name", (d.get("killer") or "?")[:8])
+            v = d.get("victim_name", (d.get("victim") or "?")[:8])
+            t = int((e.round_time or 0) // 1000)
+            is_current = i == event_idx
+            bg = "#fef3c7" if is_current else "white"
+            border = "2px solid #f59e0b" if is_current else "1px solid #e2e8f0"
+            st.markdown(
+                f"""
+                <div style="background:{bg}; border:{border}; border-radius:10px; padding:10px; margin:8px 0;">
+                  <div style="color:#94a3b8; font-size:0.85em;">{t // 60}:{t % 60:02d}</div>
+                  <div><span style="color:#0d9488; font-weight:700;">{k}</span> <span style="color:#94a3b8;">→</span> <span style="color:#ff4655; font-weight:700;">{v}</span></div>
                 </div>
-                """, unsafe_allow_html=True)
-        else:
-            st.info("No events recorded.")
-    
-    # Audio section
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Audio section (unchanged)
     st.divider()
     st.subheader("🎙️ Audio Recording")
-    
-    segments = session.query(AudioSegment).filter(
-        AudioSegment.match_id == match_id
-    ).all()
-    
+
+    segments = session.query(AudioSegment).filter(AudioSegment.match_id == match_id).all()
     if segments:
         for seg in segments:
             audio_path = Path(seg.file_path)

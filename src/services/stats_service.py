@@ -17,10 +17,61 @@ from ..db.models import (
     PlayerMapStats,
     PlayerMatchStats,
     PlayerTimeStats,
+    RoundPlayerStats,
     TimeSector,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def get_timing_zone(round_time_remaining_seconds: float, is_post_plant: bool = False) -> str:
+    """
+    Get the timing zone based on round time remaining.
+    
+    Zones:
+    - "1st": 1:40-1:20 (100s-80s remaining)
+    - "1.5th": 1:20-1:00 (80s-60s remaining)
+    - "2nd": 1:00-0:40 (60s-40s remaining)
+    - "late": 0:40-0:00 (40s-0s remaining)
+    - "pp": Post Plant
+    
+    Args:
+        round_time_remaining_seconds: Seconds remaining in round
+        is_post_plant: Whether spike has been planted
+        
+    Returns:
+        Timing zone string
+    """
+    if is_post_plant:
+        return "pp"
+    
+    if round_time_remaining_seconds >= 80:
+        return "1st"
+    elif round_time_remaining_seconds >= 60:
+        return "1.5th"
+    elif round_time_remaining_seconds >= 40:
+        return "2nd"
+    else:
+        return "late"
+
+
+def get_timing_zone_from_elapsed(round_time_elapsed_ms: int, round_duration_ms: int = 100000, is_post_plant: bool = False) -> str:
+    """
+    Get timing zone from elapsed time (Valorant API format).
+    
+    Args:
+        round_time_elapsed_ms: Milliseconds elapsed since round start
+        round_duration_ms: Total round duration in ms (default 100s)
+        is_post_plant: Whether spike has been planted
+        
+    Returns:
+        Timing zone string
+    """
+    if is_post_plant:
+        return "pp"
+    
+    remaining_seconds = (round_duration_ms - round_time_elapsed_ms) / 1000
+    return get_timing_zone(remaining_seconds, is_post_plant)
 
 
 class StatsService:
@@ -454,4 +505,305 @@ class StatsService:
                 "kd": stat.postplant_kills / max(stat.postplant_deaths, 1),
             },
         }
+    
+    # ============================================
+    # Detailed Match Stats Display
+    # ============================================
+    
+    def get_match_detailed_stats(self, match_id: str) -> list[dict]:
+        """
+        Get detailed stats for all players in a match.
+        
+        Returns stats in display format: ACS, KDA, FK, FD, True FK, KAST, etc.
+        
+        Args:
+            match_id: Match ID
+            
+        Returns:
+            List of player stats dictionaries sorted by ACS
+        """
+        stats = self.session.query(PlayerMatchStats).filter(
+            PlayerMatchStats.match_id == match_id
+        ).all()
+        
+        result = []
+        for s in stats:
+            rounds = max(s.rounds_played, 1)
+            
+            # Calculate time-based KD from JSON
+            import json
+            try:
+                time_kd = json.loads(s.time_based_kd) if s.time_based_kd else {}
+            except:
+                time_kd = {}
+            
+            result.append({
+                "puuid": s.puuid,
+                "player_name": s.player_name,
+                "tag_line": s.tag_line,
+                "agent_name": s.agent_name,
+                "team_id": s.team_id,
+                "is_ally": s.is_ally,
+                
+                # Core stats
+                "acs": s.acs,
+                "kda": s.kda,
+                "kills": s.kills,
+                "deaths": s.deaths,
+                "assists": s.assists,
+                "kd_ratio": s.kd_ratio,
+                
+                # First blood
+                "fk": s.first_kills,
+                "fd": s.first_deaths,
+                "fk_fd_diff": s.fk_fd_diff,
+                "true_fk": s.true_first_kills,  # FK取得かつラウンド勝利
+                "true_fk_rate": s.true_fk_rate,
+                
+                # KAST
+                "kast": s.kast_percentage,
+                
+                # Damage
+                "damage_dealt": s.damage_dealt,
+                "adr": round(s.damage_dealt / rounds, 1),
+                
+                # Accuracy
+                "hs_percent": s.headshot_percentage,
+                
+                # Multi-kills
+                "multi_kills": {
+                    "2k": s.multi_kills_2,
+                    "3k": s.multi_kills_3,
+                    "4k": s.multi_kills_4,
+                    "ace": s.multi_kills_5,
+                },
+                
+                # Clutches
+                "clutch_wins": s.clutch_wins,
+                "clutch_attempts": s.clutch_attempts,
+                
+                # Time-based KD (5 zones)
+                # 1st: 1:40-1:20, 1.5th: 1:20-1:00, 2nd: 1:00-0:40, late: 0:40-0:00, pp: post plant
+                "time_kd": {
+                    "1st": time_kd.get("1st", {"k": 0, "d": 0}),
+                    "1.5th": time_kd.get("1.5th", {"k": 0, "d": 0}),
+                    "2nd": time_kd.get("2nd", {"k": 0, "d": 0}),
+                    "late": time_kd.get("late", {"k": 0, "d": 0}),
+                    "pp": time_kd.get("pp", {"k": 0, "d": 0}),
+                },
+                
+                # Economy
+                "avg_loadout": s.avg_loadout_value,
+                
+                # Utility
+                "plants": s.plants,
+                "defuses": s.defuses,
+                
+                # Rounds played
+                "rounds_played": s.rounds_played,
+            })
+        
+        # Sort by ACS descending
+        result.sort(key=lambda x: x["acs"], reverse=True)
+        return result
+    
+    def format_stats_table(self, match_id: str) -> str:
+        """
+        Format match stats as a text table.
+        
+        Args:
+            match_id: Match ID
+            
+        Returns:
+            Formatted table string
+        """
+        stats = self.get_match_detailed_stats(match_id)
+        
+        if not stats:
+            return "No stats available"
+        
+        # Header
+        lines = [
+            "=" * 110,
+            f"{'Player':<20} {'Agent':<10} {'ACS':>5} {'K/D/A':>10} {'KD':>5} {'FK':>3} {'FD':>3} {'TFK':>3} {'±FK':>4} {'KAST':>6} {'HS%':>5}",
+            "-" * 110,
+        ]
+        
+        current_team = None
+        for s in stats:
+            # Team separator
+            if current_team != s["team_id"]:
+                if current_team is not None:
+                    lines.append("-" * 110)
+                current_team = s["team_id"]
+            
+            lines.append(
+                f"{s['player_name']:<20} {s['agent_name']:<10} "
+                f"{s['acs']:>5.0f} {s['kda']:>10} {s['kd_ratio']:>5.2f} "
+                f"{s['fk']:>3} {s['fd']:>3} {s['true_fk']:>3} {s['fk_fd_diff']:>+4} "
+                f"{s['kast']:>5.1f}% {s['hs_percent']:>4.1f}%"
+            )
+        
+        lines.append("=" * 110)
+        return "\n".join(lines)
+    
+    # ============================================
+    # Parse Match Details from API
+    # ============================================
+    
+    def parse_match_details(self, match_details: dict) -> dict:
+        """
+        Parse match details from Valorant API into player stats.
+        
+        Args:
+            match_details: Raw match details from API
+            
+        Returns:
+            Parsed stats by player
+        """
+        players_stats = {}
+        
+        # Get players data
+        players = match_details.get("players", [])
+        rounds = match_details.get("roundResults", [])
+        
+        # Build team mapping
+        team_players = {}  # team_id -> set of puuids
+        
+        for player in players:
+            puuid = player.get("subject", "")
+            team_id = player.get("teamId", "")
+            stats = player.get("stats", {})
+            
+            if team_id not in team_players:
+                team_players[team_id] = set()
+            team_players[team_id].add(puuid)
+            
+            players_stats[puuid] = {
+                "puuid": puuid,
+                "team_id": team_id,
+                "character_id": player.get("characterId", ""),
+                "kills": stats.get("kills", 0),
+                "deaths": stats.get("deaths", 0),
+                "assists": stats.get("assists", 0),
+                "score": stats.get("score", 0),
+                "rounds_played": stats.get("roundsPlayed", len(rounds)),
+                "damage_dealt": 0,
+                "first_kills": 0,
+                "first_deaths": 0,
+                "true_first_kills": 0,  # FK取得 & ラウンド勝利
+                "kast_rounds": 0,
+                "multi_kills": {2: 0, 3: 0, 4: 0, 5: 0},
+                "time_based_kd": {
+                    "1st": {"k": 0, "d": 0},
+                    "1.5th": {"k": 0, "d": 0},
+                    "2nd": {"k": 0, "d": 0},
+                    "late": {"k": 0, "d": 0},
+                    "pp": {"k": 0, "d": 0},
+                },
+            }
+        
+        # Process each round for detailed stats
+        for round_data in rounds:
+            round_num = round_data.get("roundNum", 0)
+            winning_team = round_data.get("winningTeam", "")
+            plant_time = round_data.get("plantRoundTime", 0)  # Time of plant in ms
+            player_stats_in_round = round_data.get("playerStats", [])
+            
+            # Find first kill/death in round
+            first_killer = None
+            first_victim = None
+            first_kill_time = float("inf")
+            
+            kills_in_round = {}  # puuid -> kill count
+            deaths_in_round = set()  # puuids who died
+            assists_in_round = set()  # puuids who assisted
+            traded_deaths = set()  # puuids who were traded
+            
+            # Collect all kills for time-based analysis
+            all_kills = []
+            
+            for ps in player_stats_in_round:
+                puuid = ps.get("subject", "")
+                damage = ps.get("damage", [])
+                kills = ps.get("kills", [])
+                
+                # Add damage
+                if puuid in players_stats:
+                    for d in damage:
+                        players_stats[puuid]["damage_dealt"] += d.get("damage", 0)
+                
+                # Track kills
+                kills_in_round[puuid] = len(kills)
+                
+                for kill in kills:
+                    victim = kill.get("victim", "")
+                    kill_time = kill.get("roundTimeMillis", 0)
+                    
+                    all_kills.append({
+                        "killer": puuid,
+                        "victim": victim,
+                        "time": kill_time,
+                    })
+                    
+                    # Track first kill
+                    if kill_time < first_kill_time:
+                        first_kill_time = kill_time
+                        first_killer = puuid
+                        first_victim = victim
+                    
+                    deaths_in_round.add(victim)
+                    
+                    # Track assists
+                    for assist in kill.get("assistants", []):
+                        assists_in_round.add(assist.get("assistantPuuid", ""))
+            
+            # Update first kill/death stats
+            if first_killer and first_killer in players_stats:
+                players_stats[first_killer]["first_kills"] += 1
+                
+                # True FK: FK取得かつラウンド勝利
+                fk_team = players_stats[first_killer]["team_id"]
+                if fk_team == winning_team:
+                    players_stats[first_killer]["true_first_kills"] += 1
+                    
+            if first_victim and first_victim in players_stats:
+                players_stats[first_victim]["first_deaths"] += 1
+            
+            # Process time-based KD
+            for kill_data in all_kills:
+                killer = kill_data["killer"]
+                victim = kill_data["victim"]
+                kill_time = kill_data["time"]
+                
+                # Check if post-plant
+                is_post_plant = plant_time > 0 and kill_time > plant_time
+                
+                # Get timing zone
+                timing_zone = get_timing_zone_from_elapsed(kill_time, is_post_plant=is_post_plant)
+                
+                # Update time-based KD
+                if killer in players_stats:
+                    players_stats[killer]["time_based_kd"][timing_zone]["k"] += 1
+                if victim in players_stats:
+                    players_stats[victim]["time_based_kd"][timing_zone]["d"] += 1
+            
+            # Calculate KAST and multi-kills for each player
+            survivors = set(players_stats.keys()) - deaths_in_round
+            
+            for puuid in players_stats:
+                got_kill = kills_in_round.get(puuid, 0) > 0
+                got_assist = puuid in assists_in_round
+                survived = puuid in survivors
+                got_traded = puuid in traded_deaths
+                
+                if got_kill or got_assist or survived or got_traded:
+                    players_stats[puuid]["kast_rounds"] += 1
+                
+                # Multi-kills
+                kill_count = kills_in_round.get(puuid, 0)
+                if kill_count >= 2:
+                    players_stats[puuid]["multi_kills"][min(kill_count, 5)] += 1
+        
+        return players_stats
 
