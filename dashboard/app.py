@@ -542,7 +542,7 @@ def render_stats_table(players):
         
         # FK diff display
         fk_display = f"+{fk_diff}" if fk_diff > 0 else str(fk_diff)
-        
+
         data.append({
             "icon_b64": icon_b64,
             "player_name": p.player_name or "Unknown",
@@ -643,7 +643,15 @@ def render_time_kd_table(players):
         st.info("Time-based K/D data not available for this match.")
 
 
-def _render_rib_style_map(map_name: str, positions: list, event_data: dict, calibration: dict):
+def _render_rib_style_map(
+    map_name: str,
+    positions: list,
+    event_data: dict,
+    calibration: dict,
+    trace_points: list[dict] | None = None,
+    show_names: bool = False,
+    lock_view: bool = True,
+):
     """
     rib.gg 風の2Dマップ描画（マップ画像 + プレイヤー位置 + キル線）。
 
@@ -774,23 +782,61 @@ def _render_rib_style_map(map_name: str, positions: list, event_data: dict, cali
         line_color = "#fbbf24" if pt["is_killer"] else ("#ff4655" if pt["is_victim"] else base_color)
         line_w = 3 if (pt["is_killer"] or pt["is_victim"]) else 2
 
+        mode = "markers+text" if show_names else "markers"
+        kwargs: dict[str, Any] = {}
+        if show_names:
+            kwargs.update(
+                dict(
+                    text=[pt["name"][:10]],
+                    textposition="top center",
+                    textfont=dict(size=10, color=base_color, family="Arial Black"),
+                )
+            )
+
         fig.add_trace(
             go.Scatter(
                 x=[pt["x"]],
                 y=[pt["y"]],
-                mode="markers+text",
+                mode=mode,
                 marker=dict(size=size, color=color, symbol=symbol, line=dict(color=line_color, width=line_w)),
-                text=[pt["name"][:10]],
-                textposition="top center",
-                textfont=dict(size=10, color=base_color, family="Arial Black"),
                 hovertemplate=(
                     f"<b>{pt['name']}</b><br>"
                     f"team: {pt['team']}<br>"
                     f"x={pt['x']:.0f}, y={pt['y']:.0f}<extra></extra>"
                 ),
                 showlegend=False,
+                **kwargs,
             )
         )
+
+    # Trace layer (rib.ggっぽい “軌跡/分布”)
+    if trace_points:
+        tx = []
+        ty = []
+        tc = []
+        for p in trace_points:
+            try:
+                x = float(p.get("x"))
+                y = float(p.get("y"))
+            except Exception:
+                continue
+            team = p.get("team_id") or "blue"
+            xx, yy = cal_xy(x, y)
+            tx.append(xx)
+            ty.append(yy)
+            tc.append("#0ea5e9" if team == "blue" else "#ff4655")
+
+        if tx:
+            fig.add_trace(
+                go.Scatter(
+                    x=tx,
+                    y=ty,
+                    mode="markers",
+                    marker=dict(size=3, color=tc, opacity=0.10),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
 
     for pt in norm:
         add_player(pt)
@@ -821,7 +867,7 @@ def _render_rib_style_map(map_name: str, positions: list, event_data: dict, cali
         showgrid=False,
         zeroline=False,
         showticklabels=False,
-        fixedrange=True,
+        fixedrange=lock_view,
     )
     fig.update_yaxes(
         range=[b["y_min"], b["y_max"]],
@@ -830,10 +876,14 @@ def _render_rib_style_map(map_name: str, positions: list, event_data: dict, cali
         showticklabels=False,
         scaleanchor="x",
         scaleratio=1,
-        fixedrange=True,
+        fixedrange=lock_view,
     )
 
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={"displayModeBar": False, "scrollZoom": not lock_view},
+    )
 
 
 def show_statistics():
@@ -1035,6 +1085,14 @@ def show_replay():
             key=f"replay_event_{match_id}_{selected_round}",
         )
 
+    ui1, ui2, ui3 = st.columns([1, 1, 1])
+    with ui1:
+        show_names = st.checkbox("Show names", value=False, key=f"replay_show_names_{match_id}")
+    with ui2:
+        show_traces = st.checkbox("Show traces", value=True, key=f"replay_show_traces_{match_id}_{selected_round}")
+    with ui3:
+        lock_view = st.checkbox("Lock view", value=True, key=f"replay_lock_view_{match_id}")
+
     current_event = round_events[event_idx]
 
     # Parse event data (db might store dict or json string)
@@ -1065,6 +1123,34 @@ def show_replay():
         patched["team_id"] = team_id
         patched_positions.append(patched)
     positions = patched_positions
+
+    # Build trace points for the selected round (rib.ggっぽい “軌跡/分布” レイヤー)
+    trace_points = None
+    if show_traces:
+        trace_points = []
+        max_points = 2000
+        for ev in round_events:
+            pos = ev.player_positions or []
+            if isinstance(pos, str):
+                try:
+                    pos = json.loads(pos)
+                except Exception:
+                    continue
+            if not isinstance(pos, list):
+                continue
+            for i, p in enumerate(pos):
+                try:
+                    x = float(p.get("x"))
+                    y = float(p.get("y"))
+                except Exception:
+                    continue
+                puuid = p.get("puuid") or p.get("subject") or ""
+                team_id = p.get("team_id") or puuid_to_team.get(puuid) or ("blue" if i < 5 else "red")
+                trace_points.append({"x": x, "y": y, "team_id": team_id})
+                if len(trace_points) >= max_points:
+                    break
+            if len(trace_points) >= max_points:
+                break
 
     killer = event_data.get("killer_name", (event_data.get("killer") or "?")[:8])
     victim = event_data.get("victim_name", (event_data.get("victim") or "?")[:8])
@@ -1189,7 +1275,7 @@ def show_replay():
                     flip_x, flip_y = False, True
                     offset_x, offset_y, scale = 0.0, 0.0, 1.0
                 st.success(f"Auto-fit完了: x[{b_xmin:.0f},{b_xmax:.0f}] y[{b_ymin:.0f},{b_ymax:.0f}]")
-            else:
+        else:
                 st.error("座標データを抽出できませんでした（player_positionsが空/壊れている可能性）。")
 
     with col_map:
@@ -1197,6 +1283,9 @@ def show_replay():
             map_name=map_name,
             positions=positions,
             event_data=event_data,
+            trace_points=trace_points,
+            show_names=show_names,
+            lock_view=lock_view,
             calibration={
                 "x_min": b_xmin,
                 "x_max": b_xmax,
