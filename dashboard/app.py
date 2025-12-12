@@ -665,8 +665,23 @@ def _render_rib_style_map(map_name: str, positions: list, event_data: dict, cali
         map_b64 = image_to_base64(thumb_path) if thumb_path.exists() else ""
         map_mime = "image/webp"
 
-    # --- Bounds (image placement + axis range) ---
-    default_bounds = {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000}
+    # --- Bounds (image placement + axis range) per map ---
+    MAP_DEFAULT_BOUNDS = {
+        "Abyss": {"x_min": -5000, "x_max": 5000, "y_min": -4000, "y_max": 2000},
+        "Ascent": {"x_min": -6000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
+        "Bind": {"x_min": -5000, "x_max": 7500, "y_min": -5000, "y_max": 7000},
+        "Haven": {"x_min": -6500, "x_max": 7500, "y_min": -5000, "y_max": 9000},
+        "Split": {"x_min": -6000, "x_max": 7000, "y_min": -5500, "y_max": 7500},
+        "Icebox": {"x_min": -5000, "x_max": 7000, "y_min": -5000, "y_max": 7000},
+        "Breeze": {"x_min": -7000, "x_max": 9000, "y_min": -6000, "y_max": 9000},
+        "Fracture": {"x_min": -7000, "x_max": 7000, "y_min": -7000, "y_max": 7000},
+        "Pearl": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
+        "Lotus": {"x_min": -7000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
+        "Sunset": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
+        "Corrode": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
+    }
+    fallback_bounds = {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000}
+    default_bounds = MAP_DEFAULT_BOUNDS.get(map_name, fallback_bounds)
     b = {
         "x_min": float(calibration.get("x_min", default_bounds["x_min"])),
         "x_max": float(calibration.get("x_max", default_bounds["x_max"])),
@@ -906,20 +921,20 @@ def show_statistics():
 def show_replay():
     """Show 2D replay viewer (rib.gg-inspired)."""
     st.header("🎬 2D Replay")
-
+    
     session = next(get_session())
-
+    
     # Match selector
     matches = session.query(Match).order_by(Match.created_at.desc()).all()
     if not matches:
         st.info("No matches available for replay.")
         return
-
+    
     match_options = {f"{m.map_name} | {m.ally_score}-{m.enemy_score}": m.match_id for m in matches}
     selected = st.selectbox("Select Match", list(match_options.keys()))
     if not selected:
         return
-
+    
     match_id = match_options[selected]
     match = session.query(Match).filter(Match.match_id == match_id).first()
     map_name = match.map_name if match else "Unknown"
@@ -1036,12 +1051,28 @@ def show_replay():
 
     # Calibration defaults/persistence per map
     saved = _load_replay_calibration().get(map_name, {}) if map_name else {}
+    # Map-specific default bounds
+    MAP_UI_DEFAULTS = {
+        "Abyss": {"x_min": -5000, "x_max": 5000, "y_min": -4000, "y_max": 2000},
+        "Ascent": {"x_min": -6000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
+        "Bind": {"x_min": -5000, "x_max": 7500, "y_min": -5000, "y_max": 7000},
+        "Haven": {"x_min": -6500, "x_max": 7500, "y_min": -5000, "y_max": 9000},
+        "Split": {"x_min": -6000, "x_max": 7000, "y_min": -5500, "y_max": 7500},
+        "Icebox": {"x_min": -5000, "x_max": 7000, "y_min": -5000, "y_max": 7000},
+        "Breeze": {"x_min": -7000, "x_max": 9000, "y_min": -6000, "y_max": 9000},
+        "Fracture": {"x_min": -7000, "x_max": 7000, "y_min": -7000, "y_max": 7000},
+        "Pearl": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
+        "Lotus": {"x_min": -7000, "x_max": 8000, "y_min": -6000, "y_max": 8000},
+        "Sunset": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
+        "Corrode": {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000},
+    }
+    default_b = MAP_UI_DEFAULTS.get(map_name, {"x_min": -6000, "x_max": 8000, "y_min": -5000, "y_max": 8000})
     # Bounds (image placement + axis range) + affine (flip/offset/scale)
-    # Start with saved values, else reasonable defaults.
-    b_xmin = float(saved.get("x_min", -6000))
-    b_xmax = float(saved.get("x_max", 8000))
-    b_ymin = float(saved.get("y_min", -5000))
-    b_ymax = float(saved.get("y_max", 8000))
+    # Start with saved values, else map-specific defaults.
+    b_xmin = float(saved.get("x_min", default_b["x_min"]))
+    b_xmax = float(saved.get("x_max", default_b["x_max"]))
+    b_ymin = float(saved.get("y_min", default_b["y_min"]))
+    b_ymax = float(saved.get("y_max", default_b["y_max"]))
     flip_x = bool(saved.get("flip_x", False))
     flip_y = bool(saved.get("flip_y", True))
     offset_x = float(saved.get("offset_x", 0.0))
@@ -1085,7 +1116,10 @@ def show_replay():
                 st.success("Saved. 次回から自動で適用されます。")
         with cR:
             if st.button("↩️ Reset (unsaved)", key=f"cal_reset_{map_name}"):
-                b_xmin, b_xmax, b_ymin, b_ymax = -6000.0, 8000.0, -5000.0, 8000.0
+                b_xmin = float(default_b["x_min"])
+                b_xmax = float(default_b["x_max"])
+                b_ymin = float(default_b["y_min"])
+                b_ymax = float(default_b["y_max"])
                 flip_x, flip_y = False, True
                 offset_x, offset_y, scale = 0.0, 0.0, 1.0
 
